@@ -1,0 +1,15 @@
+# CI-only dependencies. PyTorch is installed separately from the CPU wheel index
+# in .github/workflows/ci.yml so Linux runners do not pull the CUDA build.
+numpy
+scipy
+scikit-image
+scikit-learn
+opencv-python-headless
+albumentations
+Pillow
+matplotlib
+tqdm
+progress
+tensorboardX
+pytest
+pytest-timeout
