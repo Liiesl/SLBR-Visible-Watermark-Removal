@@ -305,9 +305,9 @@ def test_teacher_forward_is_skipped_after_decay(modules):
     result = criterion(outputs, batch)
 
     assert counter.calls == 0
-    assert float(result["teacher"]) == 0.0
-    assert float(result["teacher_mask"]) == 0.0
-    assert float(result["teacher_cwd_h8"]) == 0.0
+    assert float(result["teacher"].detach()) == 0.0
+    assert float(result["teacher_mask"].detach()) == 0.0
+    assert float(result["teacher_cwd_h8"].detach()) == 0.0
     assert float(result["teacher_weight"]) == 0.0
     assert torch.equal(result["loss"], result["supervised"])
 
@@ -317,7 +317,7 @@ def test_teacher_forward_is_skipped_after_decay(modules):
     active_result = criterion(outputs, _make_batch())
     assert counter.calls == 1
     assert float(active_result["teacher_weight"]) == pytest.approx(1.0 / 7.0)
-    assert float(active_result["teacher"]) > 0.0
+    assert float(active_result["teacher"].detach()) > 0.0
 
 
 def test_batch_teacher_target_is_not_read_after_decay(modules):
@@ -330,7 +330,7 @@ def test_batch_teacher_target_is_not_read_after_decay(modules):
     batch = _make_batch(poison_teacher=True)
 
     result = criterion(outputs, batch)
-    assert float(result["teacher"]) == 0.0
+    assert float(result["teacher"].detach()) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -375,9 +375,9 @@ def test_one_stage_combines_supervised_and_teacher_terms(modules):
         assert result[key].numel() == 1
         assert torch.isfinite(result[key]).all()
 
-    assert float(result["teacher_mask_bce"]) > 0.0
-    assert float(result["teacher_mask_dice"]) > 0.0
-    assert float(result["teacher_cwd_h8"]) >= 0.0
+    assert float(result["teacher_mask_bce"].detach()) > 0.0
+    assert float(result["teacher_mask_dice"].detach()) > 0.0
+    assert float(result["teacher_cwd_h8"].detach()) >= 0.0
 
     expected = result["supervised"] + result["teacher_weight"] * (
         result["teacher_mask"] + 0.1 * result["teacher_cwd_h8"]
@@ -492,9 +492,9 @@ def test_validation_uses_only_supervised_terms(modules):
     result = criterion(outputs, batch)
 
     assert counter.calls == 0
-    assert float(result["teacher"]) == 0.0
-    assert float(result["teacher_mask"]) == 0.0
-    assert float(result["teacher_cwd_h8"]) == 0.0
+    assert float(result["teacher"].detach()) == 0.0
+    assert float(result["teacher_mask"].detach()) == 0.0
+    assert float(result["teacher_cwd_h8"].detach()) == 0.0
     assert float(result["teacher_weight"]) == 0.0
 
     expected = criterion.supervised(
@@ -551,10 +551,10 @@ def test_one_stage_supervises_synthetic_composites(modules):
     result = criterion(outputs, batch)
 
     assert torch.isfinite(result["loss"]).all()
-    assert float(result["alpha"]) > 0.0
-    assert float(result["alpha_l1"]) > 0.0
+    assert float(result["alpha"].detach()) > 0.0
+    assert float(result["alpha_l1"].detach()) > 0.0
     # Nonlinear rows carry no alpha target and must not be supervised.
-    assert float(result["alpha_grad"]) >= 0.0
+    assert float(result["alpha_grad"].detach()) >= 0.0
     result["loss"].backward()
     assert outputs.refine_bg.grad is not None
 
