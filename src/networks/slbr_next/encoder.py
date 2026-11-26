@@ -13,8 +13,11 @@ The encoder has two paths that meet at ``H/4``:
 The semantic branch runs in FP32 with autocast explicitly disabled (spec
 §5.4). This covers its GRN layers and the stem/downsample/depthwise
 convolutions whose FP16 parameter gradients went non-finite in the 2xT4
-training gate. The branch only operates at ``H/4``-``H/16``, so its FP32
-cost is a small fraction of the full-resolution stem.
+training gate. The Haar downsampling 1x1 projections use the same guard: the
+T5 one-stage gate reported ``down1.project`` weight gradients as non-finite
+while the loss was finite. The branch only operates at ``H/4``-``H/16``, and
+the Haar projection only at ``H/2``-``H/4``, so their FP32 cost is a small
+fraction of the full-resolution stem.
 
 The public interface is frozen for A3-A6::
 
@@ -99,6 +102,15 @@ class HaarDownsample(nn.Module):
 
     The DWT keeps all four bands; the projection learns which frequencies to
     retain at the new scale (spec §3.3).
+
+    The 1x1 projection runs in FP32 with autocast disabled. In the T5
+    one-stage FP16 gate its weight/bias gradients were the first non-finite
+    tensors even though the loss was finite: the projection was executing as
+    an autocast FP16 convolution, so its scaled weight gradient accumulated in
+    FP16. This is the same failure class as the mask-decoder attention and
+    bottleneck guards. The DWT itself is stateless and stays on the input
+    path; the projected output is cast back to the activation dtype so the
+    encoder contract is unchanged.
     """
 
     def __init__(self, in_channels: int, out_channels: int) -> None:
@@ -109,7 +121,15 @@ class HaarDownsample(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.project(self.dwt(x))
+        bands = self.dwt(x)
+        if self.project.weight.dtype != torch.float32:
+            # Explicitly half/bf16 models cannot mix FP32 weights with a
+            # half-precision activation under autocast-disabled execution.
+            return self.project(bands)
+        activation_dtype = bands.dtype
+        with torch.autocast(device_type=bands.device.type, enabled=False):
+            projected = self.project(bands.float())
+        return projected.to(dtype=activation_dtype)
 
     def extra_repr(self) -> str:
         return (

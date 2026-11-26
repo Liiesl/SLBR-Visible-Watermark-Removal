@@ -1244,7 +1244,9 @@ class OneStageLoss(nn.Module):
     only as an auxiliary regularizer:
 
     * mask: ``BCEWithLogits(student/T, sigmoid(teacher/T)) * T^2`` plus
-      SoftDice on the H, H/2 and H/4 levels, weighted ``1.0 / 0.5 / 0.25``;
+      SoftDice on the H, H/2 and H/4 levels. The level weights
+      ``1.0 / 0.5 / 0.25`` are normalized to shares that sum to one, so the
+      auxiliary's effective base mask weight is 1.0 rather than 1.75;
     * feature: CWD on the student/teacher ``H/8`` tap.
 
     There is deliberately no teacher Charbonnier, FFT or output-imitation
@@ -1289,7 +1291,11 @@ class OneStageLoss(nn.Module):
         teacher_mask_temperature: Distillation temperature ``T`` for the mask
             BCE.
         teacher_mask_dice_eps: SoftDice smoothing constant.
-        teacher_mask_scale_weights: Direct multipliers for H, H/2, H/4.
+        teacher_mask_scale_weights: Relative weights for H, H/2, H/4.
+            They are normalized internally to shares that sum to one, so the
+            auxiliary's effective base mask weight matches the documented
+            ``1.0 -> 0.0`` regularizer instead of scaling with the number of
+            levels.
         cwd_temperature: Spatial-softmax temperature used by CWD.
         student_h8_channels: Channels of ``StudentStage1Output.feature_h8``.
         teacher_h8_channels: Channels of ``TeacherTarget.bottleneck_h8``. A
@@ -1397,11 +1403,21 @@ class OneStageLoss(nn.Module):
                 "teacher_mask_scale_weights must contain three entries for "
                 f"(H, H/2, H/4), got {weights}"
             )
-        if any(weight < 0.0 for weight in weights) or sum(weights) <= 0.0:
+        if any(weight < 0.0 for weight in weights):
             raise ValueError(
-                "teacher_mask_scale_weights must be non-negative with a "
-                f"positive sum, got {weights}"
+                "teacher_mask_scale_weights must be non-negative, got "
+                f"{weights}"
             )
+        weight_sum = float(sum(weights))
+        if weight_sum <= 0.0:
+            raise ValueError(
+                "at least one teacher_mask_scale_weight must be positive"
+            )
+        # Normalize the relative level weights to a weighted mean. T2's
+        # Stage1Loss uses direct multipliers, but the one-stage auxiliary is
+        # combined with a supervised mask term; direct weights make the
+        # effective base mask weight 1.75 instead of the documented 1.0.
+        weights = tuple(weight / weight_sum for weight in weights)
         for name, value in (
             ("student_h8_channels", student_h8_channels),
             ("teacher_h8_channels", teacher_h8_channels),
@@ -1664,6 +1680,10 @@ class OneStageLoss(nn.Module):
         temperature = self.teacher_mask_temperature
         bce_terms: list[Tensor] = []
         dice_terms: list[Tensor] = []
+        # Student logits and teacher targets are cast to FP32 before BCE,
+        # SoftDice and the weighted reduction. ``_autocast_disabled`` keeps
+        # the entire block (and the gradient entering it) out of FP16/bf16
+        # autocast; the decay and level shares are applied afterwards.
         with _autocast_disabled(device):
             for name, divisor, student, teacher in zip(
                 _MASK_LEVEL_NAMES,
