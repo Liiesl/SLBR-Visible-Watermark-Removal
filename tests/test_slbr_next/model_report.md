@@ -51,6 +51,8 @@ CI result for the code commit: **191 passed, 7 skipped**.
   [45747054780](https://github.com/Liiesl/SLBR-Visible-Watermark-Removal/actions/runs/45747054780)).
   PyTorch 2.15.0 reported `mps_built=True`, `mps_available=False` and warned:
   "Skipping device Apple Paravirtual device that does not support Metal 2.0."
-  The job was removed, and the CUDA/MPS-gated skip remains. FP16 is therefore
-  not verified in hosted CI; it must be verified on a machine with a CUDA or
-  Metal GPU.
+  The job was removed, and the CUDA/MPS-gated skip remains in hosted CI.
+- **FP16 verified on Kaggle 2×T4 (2026-11-26):** the same
+  `test_fp16_contract` ran on CUDA 13.0 with the T4 GPUs and passed
+  (`1 passed in 19.59s`). This is a remote GPU verification, not a
+  GitHub-hosted CI gate; future PRs still need a GPU runner to re-run it.
