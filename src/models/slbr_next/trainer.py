@@ -31,6 +31,12 @@ Features required by the T4 profile (§5.3, §5.4):
   peak VRAM). Grad-norm/overflow detection runs after ``GradScaler.unscale_``;
   a non-finite step is skipped, logged as ``grad_norm: null`` /
   ``step_skipped: true`` and counted instead of being reported as an Inf norm.
+* Optional loss schedule hooks: ``loss.set_epoch(epoch)`` before each epoch /
+  validation and ``loss.set_progress(completed_steps, total_steps)`` before
+  each training step. ``OneStageLoss`` uses the epoch for its teacher decay
+  and ``Stage2Loss`` uses the progress for its late perceptual schedule.
+  ``Trainer(..., forward_fn=...)`` lets a loss that needs feature taps use
+  ``run_student_stage1`` while forwarding through the DDP/compile wrapper.
 
 Command lines
 -------------
@@ -100,6 +106,7 @@ LOGGER = logging.getLogger(__name__)
 
 _AMP_CHOICES = ("auto", "fp16", "bf16", "fp32")
 _COMPILE_MODES = ("default", "reduce-overhead", "max-autotune")
+_SCHEDULE_CHOICES = ("two_stage", "one_stage")
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +130,14 @@ class TrainerConfig:
     max_steps: int | None = None
     #: Images per GPU. The trainer does not slice batches; data loaders use it.
     batch_size_per_gpu: int = 6
+
+    # Training schedule (spec §5.5)
+    #: ``"two_stage"`` keeps the existing Stage 1 -> Stage 2 recipe;
+    #: ``"one_stage"`` selects the supervised + decaying-teacher auxiliary.
+    #: The loss factory reads this value; the trainer only logs/validates it.
+    schedule: str = "two_stage"
+    #: One-stage teacher auxiliary linear decay window in epochs (spec §5.5).
+    teacher_decay_epochs: int = 7
 
     # Optimization (§5.3)
     lr: float = 3e-4
@@ -176,6 +191,8 @@ class TrainerConfig:
         self.epochs = int(self.epochs)
         self.max_steps = None if self.max_steps is None else int(self.max_steps)
         self.batch_size_per_gpu = int(self.batch_size_per_gpu)
+        self.schedule = str(self.schedule).lower()
+        self.teacher_decay_epochs = int(self.teacher_decay_epochs)
         self.lr = float(self.lr)
         self.weight_decay = float(self.weight_decay)
         try:
@@ -206,6 +223,16 @@ class TrainerConfig:
             raise ValueError(f"max_steps must be >= 1 or None, got {self.max_steps}")
         if self.batch_size_per_gpu < 1:
             raise ValueError("batch_size_per_gpu must be >= 1")
+        if self.schedule not in _SCHEDULE_CHOICES:
+            raise ValueError(
+                f"schedule must be one of {_SCHEDULE_CHOICES}, "
+                f"got {self.schedule!r}"
+            )
+        if self.teacher_decay_epochs < 1:
+            raise ValueError(
+                "teacher_decay_epochs must be >= 1, got "
+                f"{self.teacher_decay_epochs}"
+            )
         if self.lr <= 0:
             raise ValueError("lr must be positive")
         if self.weight_decay < 0:
@@ -241,6 +268,11 @@ class TrainerConfig:
             raise ValueError("input_key must not be empty")
         if not self.checkpoint_name or not self.best_checkpoint_name:
             raise ValueError("checkpoint names must not be empty")
+
+    @property
+    def one_stage(self) -> bool:
+        """Whether the selected schedule is the one-stage supervised variant."""
+        return self.schedule == "one_stage"
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable dict (``betas`` becomes a list)."""
@@ -613,6 +645,13 @@ class Trainer:
             It is stepped once per optimizer step, after the update. When
             omitted :class:`WarmupCosineLR` is used.
         device: Optional device override (``"cuda:1"``, ``"cpu"``, ...).
+        forward_fn: Optional ``fn(model, inputs) -> outputs`` used instead of
+            ``model(inputs)`` in both training and validation. The one-stage
+            loss uses this to obtain ``run_student_stage1`` outputs (mask
+            logits plus the H/8 feature tap) while still forwarding through
+            the DDP/compile wrapper. When omitted, a callable
+            ``loss.forward_fn`` is used automatically;
+            ``OneStageLoss.forward_fn`` is the ready made value.
         early_stop_hook: Optional ``hook(history_entry) -> bool``. Returning
             ``True`` stops training after the epoch is logged and saved.
     """
@@ -628,12 +667,19 @@ class Trainer:
         optimizer: torch.optim.Optimizer | None = None,
         scheduler: Any | None = None,
         device: str | torch.device | None = None,
+        forward_fn: Callable[[nn.Module, torch.Tensor], Any] | None = None,
         early_stop_hook: Callable[[dict[str, Any]], bool] | None = None,
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError(f"model must be an nn.Module, got {type(model).__name__}")
         if not callable(loss):
             raise TypeError("loss must be callable")
+        if forward_fn is None:
+            candidate = getattr(loss, "forward_fn", None)
+            if callable(candidate):
+                forward_fn = candidate
+        if forward_fn is not None and not callable(forward_fn):
+            raise TypeError("forward_fn must be callable or None")
         if config is None:
             config = TrainerConfig()
         elif not isinstance(config, TrainerConfig):
@@ -642,6 +688,7 @@ class Trainer:
         self.loss = loss
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.forward_fn = forward_fn
         self.early_stop_hook = early_stop_hook
 
         self.rank, self.world_size, self.local_rank = init_distributed(
@@ -860,6 +907,8 @@ class Trainer:
                 "batch_size_per_gpu": self.config.batch_size_per_gpu,
                 "compile": self.config.compile,
                 "ddp_static_graph": self.config.ddp_static_graph,
+                "schedule": self.config.schedule,
+                "teacher_decay_epochs": self.config.teacher_decay_epochs,
             }
         )
 
@@ -922,6 +971,34 @@ class Trainer:
         except (KeyError, TypeError):
             return 1
         return int(value.shape[0]) if value.dim() > 0 else 1
+
+    def _notify_loss_epoch(self) -> None:
+        """Call an optional ``loss.set_epoch(epoch)`` schedule hook.
+
+        Losses that only implement the basic ``loss(outputs, batch)``
+        interface are unaffected. ``OneStageLoss`` uses this to decay its
+        teacher auxiliary; the call is made before each training epoch and at
+        the start of validation.
+        """
+        setter = getattr(self.loss, "set_epoch", None)
+        if callable(setter):
+            setter(self.epoch)
+
+    def _notify_loss_progress(self) -> None:
+        """Call an optional ``loss.set_progress(step, total)`` schedule hook.
+
+        ``Stage2Loss`` uses the fraction for its late perceptual schedule.
+        The trainer passes completed optimizer steps, so the first batch sees
+        progress 0.
+        """
+        setter = getattr(self.loss, "set_progress", None)
+        if callable(setter):
+            setter(self.global_step, self.total_steps)
+
+    def _forward_outputs(self, model: nn.Module, inputs: torch.Tensor) -> Any:
+        if self.forward_fn is None:
+            return model(inputs)
+        return self.forward_fn(model, inputs)
 
     def _split_loss_result(
         self, result: Any
@@ -1041,10 +1118,11 @@ class Trainer:
         batch = self._move_to_device(batch)
         inputs = self._extract_input(batch)
         self.last_lr = float(self.optimizer.param_groups[0]["lr"])
+        self._notify_loss_progress()
         started = time.perf_counter()
 
         with self._autocast_context():
-            outputs = self.model(inputs)
+            outputs = self._forward_outputs(self.model, inputs)
             loss_result = self.loss(outputs, batch)
             loss, components = self._split_loss_result(loss_result)
         loss_value = self._as_float(loss)
@@ -1192,6 +1270,7 @@ class Trainer:
         if isinstance(self.loss, nn.Module):
             self.loss.eval()
         self.raw_model.eval()
+        self._notify_loss_epoch()
         loss_sum = 0.0
         count = 0
         component_sums: dict[str, float] = {}
@@ -1210,7 +1289,9 @@ class Trainer:
             with ema_context, torch.no_grad(), self._autocast_context():
                 for batch in self.val_loader:
                     batch = self._move_to_device(batch)
-                    outputs = self.raw_model(self._extract_input(batch))
+                    outputs = self._forward_outputs(
+                        self.raw_model, self._extract_input(batch)
+                    )
                     result = self.loss(outputs, batch)
                     loss, components = self._split_loss_result(result)
                     batch_size = self._batch_size(batch)
@@ -1318,6 +1399,7 @@ class Trainer:
         self.model.train()
         if isinstance(self.loss, nn.Module):
             self.loss.train()
+        self._notify_loss_epoch()
         sampler = getattr(self.train_loader, "sampler", None)
         if hasattr(sampler, "set_epoch"):
             sampler.set_epoch(self.epoch)
