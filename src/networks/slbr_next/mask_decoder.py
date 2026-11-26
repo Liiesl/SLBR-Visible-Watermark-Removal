@@ -301,8 +301,8 @@ class MaskedCrossAttention(nn.Module):
         key, value = self.kv_proj(self.feature_norm(features)).chunk(
             2, dim=1
         )
-        key = key.reshape(batch, self.heads, self.head_dim, -1)
-        value = value.reshape(batch, self.heads, self.head_dim, -1)
+        key = key.reshape(batch, self.heads, -1, self.head_dim)
+        value = value.reshape(batch, self.heads, -1, self.head_dim)
 
         logits = torch.matmul(query.float(), key.float().transpose(-2, -1))
         logits = logits * self.temperature.float()
