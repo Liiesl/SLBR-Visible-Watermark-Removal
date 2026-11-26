@@ -16,8 +16,10 @@ Covers spec §1 (contracts), §3.8 (shape flow), §6.1 (functional tests) and
 * an unconditional FP32 contract test and a CUDA/MPS-gated FP16 contract test.
 
 The FP16 test is skipped on the hosted Linux CPU runner because CPU FP16
-convolution is unsupported there. The ``fp16-mps`` CI job runs this file's
-FP16 test on ``macos-15`` when Metal/MPS is available.
+convolution is unsupported there. It is CUDA/MPS-gated for local and GPU CI
+runners; GitHub's macOS 15 paravirtual Metal device reports that it does not
+support Metal 2.0, so MPS is unavailable on that hosted runner (documented in
+``model_report.md``).
 """
 
 from __future__ import annotations
@@ -289,8 +291,12 @@ def test_flops_at_256(model):
     x = torch.rand(1, 3, 256, 256)
     counter = FlopCounterMode(display=False)
 
-    with torch.no_grad(), counter:
-        model(x)
+    # FlopCounterMode's ModuleTracker asserts on parameters without a grad_fn,
+    # so it must run with autograd enabled (no ``torch.no_grad()`` here). No
+    # backward pass is performed and the graph is released immediately.
+    with counter:
+        output = model(x)
+    del output
 
     total_flops = counter.get_total_flops()
     print(
