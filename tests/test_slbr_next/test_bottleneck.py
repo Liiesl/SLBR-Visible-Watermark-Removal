@@ -609,6 +609,102 @@ def test_h8_stem_fp32_under_bf16_autocast_keeps_grads_finite(monkeypatch):
         assert torch.isfinite(tensor.grad).all()
 
 
+def test_remaining_bottleneck_paths_fp32_under_bf16_autocast_keep_grads_finite(
+    monkeypatch,
+):
+    """Regression guard for the step-2 frequency/trunk FP16 overflow.
+
+    After the shared-stem guard, the 2xT4 smoke reports non-finite unscaled
+    gradients in ``bottleneck.freq_branch.pre.bias``, ``post.bias`` and
+    ``mask_trunk.blocks_h8.0.project_conv.bias`` at step 2. The residual
+    frequency branch and both trunk stages still executed inside FP16
+    autocast, so their 1x1 projections and NAF blocks accumulated scaled
+    gradients beyond the FP16 range.
+
+    The whole low-resolution bottleneck now runs in FP32 with autocast
+    disabled. The conv spy fails on the step-1-only code, where the
+    frequency/trunk convolutions still see autocast enabled, and the large
+    65536x synthetic loss asserts finite gradients for every remaining
+    frequency and trunk parameter.
+    """
+    torch.manual_seed(0)
+    bottleneck = SLBRNextBottleneck(
+        encoder_h8_channels=256,
+        encoder_h16_channels=128,
+        mask_width=128,
+        bg_width=128,
+        mask_width_h16=64,
+        bg_width_h16=64,
+        shared_width=256,
+        stem_blocks=1,
+        blocks_h8=1,
+        blocks_h16=1,
+        blocks_h8_post=1,
+        mdta_heads=4,
+        freq_width=128,
+        freq_heads=2,
+        freq_kernel_size=3,
+        dw_kernel_size=5,
+    ).train()
+
+    x_h8 = (torch.randn(2, 256, 32, 32) * 8.0).requires_grad_(True)
+    x_h16 = (torch.randn(2, 128, 16, 16) * 8.0).requires_grad_(True)
+
+    calls = []
+    real_conv2d = F.conv2d
+
+    def checked_conv2d(input, weight, *args, **kwargs):
+        calls.append(
+            (input.dtype, weight.dtype, _autocast_cpu_enabled())
+        )
+        return real_conv2d(input, weight, *args, **kwargs)
+
+    monkeypatch.setattr(F, "conv2d", checked_conv2d)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = bottleneck.forward_features(x_h8, x_h16)
+        loss = 65536.0 * (
+            output.mask_h8.float().square().mean()
+            + output.mask_h16.float().square().mean()
+            + output.bg_h8.float().square().mean()
+            + output.bg_h16.float().square().mean()
+        )
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    for tensor in (
+        output.mask_h8,
+        output.mask_h16,
+        output.bg_h8,
+        output.bg_h16,
+    ):
+        assert tensor.dtype == x_h8.dtype
+
+    assert calls
+    for input_dtype, weight_dtype, autocast_enabled in calls:
+        assert input_dtype == torch.float32
+        assert weight_dtype == torch.float32
+        assert autocast_enabled is False
+
+    parameters = dict(bottleneck.named_parameters())
+    for name in (
+        "freq_branch.pre.bias",
+        "freq_branch.post.bias",
+        "mask_trunk.blocks_h8.0.project_conv.bias",
+    ):
+        parameter = parameters[name]
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+
+    for prefix in ("freq_branch.", "mask_trunk.", "bg_trunk."):
+        names = [name for name in parameters if name.startswith(prefix)]
+        assert names, prefix
+        for name in names:
+            parameter = parameters[name]
+            assert parameter.grad is not None, name
+            assert torch.isfinite(parameter.grad).all(), name
+
+
 def test_interpolation_targets_reference_sizes(monkeypatch, tiny_bottleneck):
     recorded = []
     real_interpolate = F.interpolate

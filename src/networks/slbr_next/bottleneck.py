@@ -37,11 +37,12 @@ Invariants (spec §1.3)
 * No BatchNorm or InstanceNorm anywhere.
 * No shape reversals; every interpolation targets ``size=x.shape[2:]`` of the
   reference tensor, with ``align_corners=False``.
-* The shared H/8 stem runs in FP32 with autocast disabled (A2/A4 pattern):
-  its 1x1 stem/project/mixer convolutions receive the summed mask,
-  background and frequency gradients and overflowed FP16 weight-gradient
-  accumulation in the 2xT4 Stage 2 smoke. The output is cast back to the
-  activation dtype.
+* The entire bottleneck feature path (shared H/8 stem, Haar frequency
+  branch, and both mask/background trunks at H/8 and H/16) runs in FP32 with
+  autocast disabled (A2/A4 pattern). Its 1x1 projections and NAF blocks
+  accumulated FP16 weight/bias gradients that overflowed the GradScaler range
+  in the 2xT4 Stage 2 smoke. The four outputs are cast back to the activation
+  dtype.
 * MDTA keeps ``F.normalize``, ``softmax`` and the attention matmul in FP32 and
   casts the result back to the activation dtype.
 """
@@ -740,31 +741,27 @@ class SLBRNextBottleneck(nn.Module):
             )
         return self.forward_features(features.x_h8, features.x_h16)
 
-    def _forward_shared_stem(self, x: Tensor) -> Tensor:
-        """Run the shared H/8 stem in FP32 with autocast disabled.
+    def _forward_core(
+        self, x_h8: Tensor, x_h16: Tensor
+    ) -> BottleneckOutput:
+        """Bottleneck computation without dtype guards.
 
-        The 2xT4 Stage 2 smoke reports non-finite unscaled gradients first in
-        ``h8_stem.0.bias`` and the NAF block's ``project_conv``/``mixer``
-        1x1 convolutions while the loss is finite. This stem is shared by the
-        mask trunk, background trunk and frequency branch, so its backward
-        receives the sum of all three paths. With GradScaler's initial
-        ``65536`` scale, the FP16 weight/bias-gradient accumulation over the
-        ``B * H/8 * W/8`` samples overflows.
-
-        Follow the A2/A4 pattern: run the small H/8 stem inside
-        ``autocast(enabled=False)`` with FP32 tensors, then cast the result
-        back to the activation dtype. AMP stores FP32 master weights, so the
-        guarded path applies to real FP16 training; an explicitly half model
-        keeps its native path and is unchanged.
+        Callers select the FP32 or native-precision path; validation and
+        output casting live in :meth:`forward_features`.
         """
-        parameter = next(self.h8_stem.parameters(), None)
-        if parameter is None or parameter.dtype != torch.float32:
-            return self.h8_stem(x)
+        shared = self.h8_stem(x_h8)
+        if self.frequency_branch:
+            shared = shared + self.freq_branch(shared)
 
-        activation_dtype = x.dtype
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            stem = self.h8_stem(x.float())
-        return stem.to(dtype=activation_dtype)
+        mask_h8, mask_h16 = self.mask_trunk(shared, x_h8, x_h16)
+        bg_h8, bg_h16 = self.bg_trunk(shared, x_h8, x_h16)
+
+        return BottleneckOutput(
+            mask_h8=mask_h8,
+            mask_h16=mask_h16,
+            bg_h8=bg_h8,
+            bg_h16=bg_h16,
+        )
 
     def forward_features(
         self, x_h8: Tensor, x_h16: Tensor
@@ -792,18 +789,26 @@ class SLBRNextBottleneck(nn.Module):
                 f"(input multiple of 16), got {tuple(x_h8.shape[2:])}"
             )
 
-        shared = self._forward_shared_stem(x_h8)
-        if self.frequency_branch:
-            shared = shared + self.freq_branch(shared)
+        # The whole low-resolution bottleneck runs in FP32 under AMP. Guarding
+        # only the shared H/8 stem moved the Stage 2 failure to
+        # ``freq_branch.pre/post`` and the mask trunk's first H/8 NAF block;
+        # the remaining FP16 gradient-accumulation surface is therefore closed
+        # in one place. AMP keeps FP32 master weights, so this path applies to
+        # real FP16 training. An explicitly half model keeps its native path,
+        # and every output is cast back to the activation dtype.
+        parameter = next(self.parameters(), None)
+        if parameter is None or parameter.dtype != torch.float32:
+            return self._forward_core(x_h8, x_h16)
 
-        mask_h8, mask_h16 = self.mask_trunk(shared, x_h8, x_h16)
-        bg_h8, bg_h16 = self.bg_trunk(shared, x_h8, x_h16)
+        activation_dtype = x_h8.dtype
+        with torch.autocast(device_type=x_h8.device.type, enabled=False):
+            output = self._forward_core(x_h8.float(), x_h16.float())
 
         return BottleneckOutput(
-            mask_h8=mask_h8,
-            mask_h16=mask_h16,
-            bg_h8=bg_h8,
-            bg_h16=bg_h16,
+            mask_h8=output.mask_h8.to(dtype=activation_dtype),
+            mask_h16=output.mask_h16.to(dtype=activation_dtype),
+            bg_h8=output.bg_h8.to(dtype=activation_dtype),
+            bg_h16=output.bg_h16.to(dtype=activation_dtype),
         )
 
     def extra_repr(self) -> str:
