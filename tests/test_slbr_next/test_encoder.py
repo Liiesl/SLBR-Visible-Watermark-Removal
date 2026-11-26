@@ -302,6 +302,81 @@ def test_semantic_branch_input_is_imagenet_normalized(monkeypatch):
     )
 
 
+def _autocast_cpu_enabled():
+    try:
+        return torch.is_autocast_enabled("cpu")
+    except TypeError:  # pragma: no cover - older torch signature
+        return torch.is_autocast_cpu_enabled()
+
+
+def test_semantic_branch_and_fusions_run_fp32_under_bf16_autocast():
+    """Regression guard for the 2xT4 FP16 backward failure.
+
+    The T6 log shows non-finite gradients first in the timm ConvNeXt V2
+    ``stem_0`` and stage-1 downsample/depthwise convolutions. CPU FP16
+    convolution is unsupported, so BF16 autocast is the reduced-precision
+    proxy: BF16 has FP32's exponent range and cannot reproduce an FP16 range
+    overflow by itself, but the spy still catches the pre-fix code, which
+    executed the branch inside the autocast region. The fix must isolate the
+    semantic branch and its 1x1 fusion projections from autocast, run them in
+    FP32, and keep every parameter gradient finite under a large synthetic
+    loss.
+    """
+    torch.manual_seed(0)
+    encoder = SLBRNextEncoder(
+        widths=(16, 32, 64, 128, 256),
+        stem_blocks=1,
+        downsample="conv",
+        convnext_pretrained=False,
+    ).train()
+
+    branch_calls = []
+    fusion_calls = []
+
+    class _Recorder(nn.Module):
+        def __init__(self, inner, calls):
+            super().__init__()
+            self.inner = inner
+            self.calls = calls
+
+        def forward(self, x):
+            self.calls.append((x.dtype, _autocast_cpu_enabled()))
+            return self.inner(x)
+
+    encoder.semantic_branch = _Recorder(
+        encoder.semantic_branch, branch_calls
+    )
+    encoder.fuse_h8 = _Recorder(encoder.fuse_h8, fusion_calls)
+
+    x = torch.rand(2, 3, 64, 96) * 8.0 - 4.0
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = encoder(x)
+        loss = sum(
+            feature.float().square().mean()
+            for feature in (output.x_h4, output.x_h8, output.x_h16)
+        )
+
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    assert branch_calls == [(torch.float32, False)]
+    assert fusion_calls == [(torch.float32, False)]
+
+    branch_names = []
+    for name, parameter in encoder.semantic_branch.named_parameters():
+        branch_names.append(name)
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+    assert any("stem" in name for name in branch_names)
+    assert any("downsample" in name for name in branch_names)
+    assert any("conv_dw" in name for name in branch_names)
+
+    for name, parameter in encoder.named_parameters():
+        if name.startswith(("fuse_h4.", "fuse_h8.", "fuse_h16.")):
+            assert parameter.grad is not None, name
+            assert torch.isfinite(parameter.grad).all(), name
+
+
 # ---------------------------------------------------------------------------
 # Downsampling configuration
 # ---------------------------------------------------------------------------
