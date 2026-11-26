@@ -18,7 +18,8 @@ The data factory is responsible for the batch format. Mapping batches must
 contain ``config.input_key`` (default ``"image"``); tuple/list batches use the
 first element. With ``torchrun``, build the loaders with
 ``DistributedSampler(dataset, num_replicas=args.world_size, rank=args.rank)``;
-the trainer does not add a sampler.
+the trainer does not add a sampler. ``args.subset_size`` is an optional cap
+the factory may use for short A/B runs.
 
 Two-T4 Kaggle smoke (synthetic data, no dataset or pretrained download)
 ----------------------------------------------------------------------
@@ -60,6 +61,28 @@ Real training::
         --data-factory src.data.slbr_next:build_loaders \
         --loss-factory src.losses.slbr_next:build_loss \
         --epochs 30 --output-dir /kaggle/working/slbr_next
+
+One-stage schedule (spec §5.5)
+------------------------------
+``--schedule one_stage`` selects a supervised run on paired GT plus synthetic
+composites with a teacher mask + H/8 regularizer that decays to zero over
+``--teacher-decay-epochs`` (default 7). The reference loss factory is::
+
+    --loss-factory src.models.slbr_next.losses_stage1:build_schedule_loss \
+    --schedule one_stage --teacher-decay-epochs 7 --no-compile
+
+Add ``--perceptual none`` to a short A/B to skip the optional LPIPS backend
+and isolate the schedule comparison; the default ``auto`` enables it after the
+Stage 2-style progress threshold.
+
+The data factory must emit ``image``, ``clean`` and ``mask`` (plus optional
+``alpha_pred``/``alpha_gt``/``alpha_valid``/``confidence``) and, while the
+teacher is active, a ``teacher_target`` TeacherTarget payload. ``two_stage``
+uses the existing Stage 1 distillation criterion through the same factory.
+Stage 1/one-stage criteria expose ``forward_fn``; the CLI passes it to the
+trainer, which builds the mask logits and H/8 feature tap with
+``run_student_stage1``. Run this schedule eagerly (``--no-compile``) because
+the feature hooks can graph-break ``torch.compile``.
 """
 
 from __future__ import annotations
@@ -108,6 +131,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Images per GPU (default 6; test 8/10 separately).")
+    parser.add_argument("--schedule", choices=("two_stage", "one_stage"),
+                        default=None,
+                        help="Two-stage recipe (default) or one-stage "
+                             "supervised + decaying teacher auxiliary.")
+    parser.add_argument("--teacher-decay-epochs", type=int, default=None,
+                        help="One-stage teacher auxiliary decay window "
+                             "(default 7; spec 5-10).")
+    parser.add_argument("--perceptual", choices=("auto", "none"), default=None,
+                        help="One-stage supervised perceptual term. 'none' "
+                             "disables the optional LPIPS backend.")
+    parser.add_argument("--subset-size", type=int, default=None,
+                        help="Optional paired-sample cap read by the data "
+                             "factory for short A/B runs.")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--betas", type=float, nargs=2, default=None,
@@ -192,6 +228,8 @@ def _apply_config_overrides(
         "epochs": "epochs",
         "max_steps": "max_steps",
         "batch_size": "batch_size_per_gpu",
+        "schedule": "schedule",
+        "teacher_decay_epochs": "teacher_decay_epochs",
         "lr": "lr",
         "weight_decay": "weight_decay",
         "warmup_steps": "warmup_steps",
@@ -280,6 +318,15 @@ def main(argv: list[str] | None = None) -> int:
 
         model = SLBRNextV1(convnext_pretrained=not args.no_pretrained)
 
+    # The one-stage H/8 CWD regularizer needs the student background-trunk
+    # width. Read it from the v1 config when available; the default matches
+    # the reference SLBRNextV1 (256 channels, same as the SLBR teacher tap).
+    model_config = getattr(model, "config", None)
+    if model_config is not None:
+        student_h8 = getattr(model_config, "bottleneck_bg_width", None)
+        if student_h8 is not None:
+            args.student_h8_channels = int(student_h8)
+
     data_factory = _load_factory(args.data_factory)
     loaders = data_factory(args)
     if not isinstance(loaders, (tuple, list)) or len(loaders) != 2:
@@ -292,6 +339,11 @@ def main(argv: list[str] | None = None) -> int:
     loss = loss_factory(args)
     if not callable(loss):
         raise TypeError("loss factory must return a callable")
+    # Stage 1 and one-stage losses consume run_student_stage1 outputs; they
+    # expose forward_fn so the trainer can build them without a second API.
+    forward_fn = getattr(loss, "forward_fn", None)
+    if forward_fn is not None and not callable(forward_fn):
+        raise TypeError("loss.forward_fn must be callable or None")
 
     trainer = Trainer(
         model=model,
@@ -300,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
         val_loader=val_loader,
         config=config,
         device=args.device,
+        forward_fn=forward_fn,
     )
     if args.resume is not None:
         trainer.resume(args.resume)

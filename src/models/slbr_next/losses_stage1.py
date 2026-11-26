@@ -86,23 +86,53 @@ Numerical and shape notes
   size.
 * All teacher tensors are detached. Mask/FFT/CWD arithmetic runs in FP32 with
   autocast explicitly disabled for the FFT and for the logit losses.
+
+One-stage schedule (spec §5.5)
+------------------------------
+:class:`OneStageLoss` is an optional alternative to the two-stage recipe. It
+runs the full Stage 2 supervised criterion (:class:`Stage2Loss`: paired GT
+reconstruction, mask and alpha terms, plus synthetic composites supplied by
+the data pipeline) and attaches the frozen teacher **only** as a decaying
+auxiliary regularizer:
+
+* final/multi-scale teacher mask logits, and
+* the ``H/8`` feature tap via CWD.
+
+There is no teacher output imitation (no teacher Charbonnier/FFT/output
+term). The auxiliary weight decays linearly from ``1.0`` at epoch 0 to
+exactly ``0.0`` at ``teacher_decay_epochs`` (default 7, spec's 5-10 epoch
+window). At and after that epoch the teacher is not called at all: the loss
+skips the target lookup and the teacher forward, so no teacher graph or
+compute exists. ``OneStageLoss`` is only active in training mode; the trainer
+runs validation under ``eval()``, which forces the auxiliary to exact zero and
+keeps validation on GT/supervised terms only.
+
+:class:`TwoStageScheduleLoss` is a thin trainer adapter around the existing
+:class:`Stage1Loss` so both schedules use the same ``loss(outputs, batch)``
+contract. :func:`build_schedule_loss` selects one from the trainer CLI's
+``schedule`` configuration.
 """
 
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .losses_stage2 import Stage2Loss
 from .teacher import TeacherTarget
 
 __all__ = [
-    "StudentStage1Output",
+    "OneStageLoss",
     "Stage1Loss",
+    "StudentStage1Output",
+    "TwoStageScheduleLoss",
+    "build_schedule_loss",
     "run_student_stage1",
 ]
 
@@ -321,6 +351,18 @@ class StudentStage1Output:
                 )
 
 
+def _hook_root(model: nn.Module) -> nn.Module:
+    """Follow ``.module`` wrappers so forward hooks reach the v1 children."""
+    seen: set[int] = set()
+    while id(model) not in seen:
+        seen.add(id(model))
+        inner = getattr(model, "module", None)
+        if not isinstance(inner, nn.Module):
+            break
+        model = inner
+    return model
+
+
 def run_student_stage1(
     model: nn.Module,
     x: Tensor,
@@ -332,6 +374,10 @@ def run_student_stage1(
     The model is expected to expose the assembled v1 children
     ``mask_decoder``, ``bottleneck.bg_trunk`` and ``background_decoder``. The
     hooks are temporary and always removed, including when the forward raises.
+    Wrapping modules (``DistributedDataParallel``, the trainer's compile
+    fallback) are unwrapped only to find those children; the outermost module
+    still runs the forward, so DDP reduction and compile dispatch stay active.
+    Stage 1 should run eagerly: hooks can graph-break ``torch.compile``.
 
     Args:
         model: An :class:`~src.networks.slbr_next.model.SLBRNextV1` (or a
@@ -354,12 +400,13 @@ def run_student_stage1(
         )
     x = _require_4d("student input", x)
 
-    mask_module = getattr(model, "mask_decoder", None)
-    bottleneck = getattr(model, "bottleneck", None)
+    hook_model = _hook_root(model)
+    mask_module = getattr(hook_model, "mask_decoder", None)
+    bottleneck = getattr(hook_model, "bottleneck", None)
     bg_trunk = (
         None if bottleneck is None else getattr(bottleneck, "bg_trunk", None)
     )
-    background_module = getattr(model, "background_decoder", None)
+    background_module = getattr(hook_model, "background_decoder", None)
 
     missing = [
         name
@@ -1095,3 +1142,676 @@ class Stage1Loss(nn.Module):
             f"fft_weight={self.fft_weight}, "
             f"full_h_every={self.full_h_every}"
         )
+
+
+# ---------------------------------------------------------------------------
+# One-stage supervised schedule (spec §5.5)
+# ---------------------------------------------------------------------------
+
+
+class TwoStageScheduleLoss(nn.Module):
+    """Trainer adapter for the existing two-stage recipe's Stage 1 criterion.
+
+    :class:`Stage1Loss` expects a :class:`TeacherTarget` as its second
+    positional argument, while the trainer calls ``loss(outputs, batch)``.
+    This adapter pulls the cached/live target from ``batch[target_key]`` (and
+    the optional full-H teacher tap from ``batch[full_h_key]``), then returns
+    the Stage 1 mapping with the trainer's required ``"loss"`` key added.
+
+    The wrapped :class:`Stage1Loss` is unchanged, so the two-stage behavior
+    (and its optimizer/adapters contract) is identical to calling it directly.
+    ``forward_fn`` is exposed for ``Trainer(..., forward_fn=...)`` and for the
+    CLI, because Stage 1 consumes :func:`run_student_stage1` outputs rather
+    than the raw v1 forward tuple.
+    """
+
+    def __init__(
+        self,
+        criterion: Stage1Loss | None = None,
+        *,
+        target_key: str = "teacher_target",
+        full_h_key: str = "teacher_full_h",
+    ) -> None:
+        super().__init__()
+        if criterion is None:
+            criterion = Stage1Loss()
+        if not isinstance(criterion, Stage1Loss):
+            raise TypeError(
+                "criterion must be a Stage1Loss, got "
+                f"{type(criterion).__name__}"
+            )
+        if not target_key:
+            raise ValueError("target_key must not be empty")
+        if not full_h_key:
+            raise ValueError("full_h_key must not be empty")
+        self.criterion = criterion
+        self.target_key = str(target_key)
+        self.full_h_key = str(full_h_key)
+        #: The trainer can use this to build StudentStage1Output.
+        self.forward_fn = run_student_stage1
+
+    def set_step(self, step: int) -> None:
+        """Forward the optimizer step to the wrapped full-H schedule."""
+        self.criterion.set_step(step)
+
+    def set_progress(self, step: float, total: float) -> None:
+        """Map the trainer's progress hook onto the Stage 1 step schedule."""
+        del total
+        self.criterion.set_step(int(step))
+
+    def forward(
+        self,
+        outputs: StudentStage1Output,
+        batch: Mapping[str, object],
+    ) -> dict[str, Tensor]:
+        if not isinstance(batch, Mapping):
+            raise TypeError(
+                "TwoStageScheduleLoss expects a mapping batch with a "
+                f"{self.target_key!r} entry, got {type(batch).__name__}"
+            )
+        if self.target_key not in batch:
+            raise KeyError(
+                f"two-stage batch is missing {self.target_key!r}; the data "
+                "factory must supply a TeacherTarget or its cached payload"
+            )
+        target = batch[self.target_key]
+        teacher_full_h = batch.get(self.full_h_key)
+        if teacher_full_h is not None and not isinstance(
+            teacher_full_h, Tensor
+        ):
+            raise TypeError(
+                f"{self.full_h_key} must be a tensor or None, got "
+                f"{type(teacher_full_h).__name__}"
+            )
+        result = self.criterion(
+            outputs, target, teacher_full_h=teacher_full_h
+        )
+        payload = dict(result)
+        payload["loss"] = result["total"]
+        return payload
+
+    def extra_repr(self) -> str:
+        return f"target_key={self.target_key!r}"
+
+
+class OneStageLoss(nn.Module):
+    """One-stage supervised criterion with a decaying teacher auxiliary.
+
+    The supervised term is an internal :class:`Stage2Loss`; it consumes paired
+    GT (clean/mask, optional alpha/confidence) and synthetic composites
+    produced by the data pipeline with
+    :func:`~.losses_stage2.build_synthetic_composite`. The teacher is used
+    only as an auxiliary regularizer:
+
+    * mask: ``BCEWithLogits(student/T, sigmoid(teacher/T)) * T^2`` plus
+      SoftDice on the H, H/2 and H/4 levels, weighted ``1.0 / 0.5 / 0.25``;
+    * feature: CWD on the student/teacher ``H/8`` tap.
+
+    There is deliberately no teacher Charbonnier, FFT or output-imitation
+    term; ``teacher.refine_bg``/``teacher.coarse_bg`` are never read. The
+    auxiliary is scaled by ``teacher_weight``, a linear decay from ``1.0`` at
+    ``set_epoch(0)`` to exactly ``0.0`` at ``teacher_decay_epochs`` (default
+    7). At and after that epoch the target lookup and teacher forward are
+    skipped entirely, so no teacher compute or graph exists.
+
+    The teacher source is either a callable (for example
+    :class:`~.teacher.SLBRTeacher`, an ``nn.Module`` or a test double) called
+    with ``batch[input_key]``, or a cached target in ``batch[target_key]``.
+    Plain ``nn.Module`` teachers are forced to ``eval()`` and every parameter
+    gets ``requires_grad_(False)``. Inputs are passed as raw RGB in ``[0, 1]``
+    with **no ImageNet normalization**; the SLBR teacher contract is
+    ``norm = denorm = identity``.
+
+    Teacher use is training-only. The trainer calls ``loss.eval()`` for
+    validation, which forces the auxiliary to exact zero and never reads the
+    batch target; validation therefore reports the GT/supervised terms only.
+    ``Stage2Loss.set_progress`` is forwarded through :meth:`set_progress`, so
+    the late perceptual schedule keeps working under the trainer's injected
+    loss interface.
+
+    Args:
+        supervised: Pre-built :class:`Stage2Loss`. Mutually exclusive with
+            ``supervised_kwargs``.
+        supervised_kwargs: Keyword arguments for a default :class:`Stage2Loss`.
+            The default backend is LPIPS-aware; tests and validation-only
+            callers normally pass ``{"perceptual": None}``.
+        teacher: Optional callable ``teacher(images) -> TeacherTarget`` or a
+            target payload mapping. ``None`` means the target must be in the
+            batch. A plain ``nn.Module`` is deliberately kept out of the
+            criterion module tree, so ``criterion.to(device)`` and the
+            optimizer do not move or train it; place it on the training
+            device yourself.
+        enable_teacher: Disable the auxiliary entirely (weight stays 0.0).
+        teacher_decay_epochs: Linear decay window in epochs (default 7,
+            spec's 5-10 epoch window). Must be positive.
+        teacher_mask_weight: Base multiplier for the mask regularizer.
+        teacher_cwd_weight: Base multiplier for the H/8 CWD regularizer.
+        teacher_mask_temperature: Distillation temperature ``T`` for the mask
+            BCE.
+        teacher_mask_dice_eps: SoftDice smoothing constant.
+        teacher_mask_scale_weights: Direct multipliers for H, H/2, H/4.
+        cwd_temperature: Spatial-softmax temperature used by CWD.
+        student_h8_channels: Channels of ``StudentStage1Output.feature_h8``.
+        teacher_h8_channels: Channels of ``TeacherTarget.bottleneck_h8``. A
+            1x1 adapter is created only when the two channel counts differ;
+            include ``criterion.parameters()`` in the optimizer in that case.
+        input_key: Batch key passed to an online teacher.
+        clean_key, mask_key, confidence_key: Supervised GT keys.
+        alpha_pred_key, alpha_gt_key, alpha_valid_key: Optional alpha keys
+            (v2 head output and true linear-blend alpha).
+        teacher_target_key: Batch key for a cached/live teacher target.
+    """
+
+    def __init__(
+        self,
+        *,
+        supervised: Stage2Loss | None = None,
+        supervised_kwargs: Mapping[str, Any] | None = None,
+        teacher: Callable[..., object] | None = None,
+        enable_teacher: bool = True,
+        teacher_decay_epochs: int = 7,
+        teacher_mask_weight: float = 1.0,
+        teacher_cwd_weight: float = 0.1,
+        teacher_mask_temperature: float = 2.0,
+        teacher_mask_dice_eps: float = 1.0,
+        teacher_mask_scale_weights: tuple[float, float, float] = (
+            1.0,
+            0.5,
+            0.25,
+        ),
+        cwd_temperature: float = 1.0,
+        student_h8_channels: int = 256,
+        teacher_h8_channels: int = 256,
+        input_key: str = "image",
+        clean_key: str = "clean",
+        mask_key: str = "mask",
+        confidence_key: str = "confidence",
+        alpha_pred_key: str = "alpha_pred",
+        alpha_gt_key: str = "alpha_gt",
+        alpha_valid_key: str = "alpha_valid",
+        teacher_target_key: str = "teacher_target",
+    ) -> None:
+        super().__init__()
+
+        if supervised is not None and supervised_kwargs is not None:
+            raise ValueError(
+                "pass either supervised or supervised_kwargs, not both"
+            )
+        if supervised is None:
+            supervised = Stage2Loss(**dict(supervised_kwargs or {}))
+        if not isinstance(supervised, Stage2Loss):
+            raise TypeError(
+                "supervised must be a Stage2Loss, got "
+                f"{type(supervised).__name__}"
+            )
+        self.supervised = supervised
+
+        if teacher is not None and not callable(teacher):
+            raise TypeError(
+                "teacher must be callable or None, got "
+                f"{type(teacher).__name__}"
+            )
+        if isinstance(teacher, nn.Module):
+            teacher.eval()
+            for parameter in teacher.parameters():
+                parameter.requires_grad_(False)
+        # Bypass nn.Module.__setattr__: a teacher must not become a submodule,
+        # otherwise criterion.train()/to(device) would mutate the frozen net.
+        object.__setattr__(self, "_teacher_source", teacher)
+
+        if not isinstance(teacher_decay_epochs, int) or isinstance(
+            teacher_decay_epochs, bool
+        ):
+            raise TypeError("teacher_decay_epochs must be an int")
+        if teacher_decay_epochs <= 0:
+            raise ValueError(
+                "teacher_decay_epochs must be positive, got "
+                f"{teacher_decay_epochs}"
+            )
+        if float(teacher_mask_temperature) <= 0.0:
+            raise ValueError(
+                "teacher_mask_temperature must be positive, got "
+                f"{teacher_mask_temperature}"
+            )
+        if float(teacher_mask_dice_eps) <= 0.0:
+            raise ValueError(
+                "teacher_mask_dice_eps must be positive, got "
+                f"{teacher_mask_dice_eps}"
+            )
+        if float(cwd_temperature) <= 0.0:
+            raise ValueError(
+                "cwd_temperature must be positive, got "
+                f"{cwd_temperature}"
+            )
+        for name, value in (
+            ("teacher_mask_weight", teacher_mask_weight),
+            ("teacher_cwd_weight", teacher_cwd_weight),
+        ):
+            if float(value) < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+        weights = tuple(
+            float(weight) for weight in teacher_mask_scale_weights
+        )
+        if len(weights) != len(_MASK_LEVEL_NAMES):
+            raise ValueError(
+                "teacher_mask_scale_weights must contain three entries for "
+                f"(H, H/2, H/4), got {weights}"
+            )
+        if any(weight < 0.0 for weight in weights) or sum(weights) <= 0.0:
+            raise ValueError(
+                "teacher_mask_scale_weights must be non-negative with a "
+                f"positive sum, got {weights}"
+            )
+        for name, value in (
+            ("student_h8_channels", student_h8_channels),
+            ("teacher_h8_channels", teacher_h8_channels),
+        ):
+            if int(value) <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        for name, key in (
+            ("input_key", input_key),
+            ("clean_key", clean_key),
+            ("mask_key", mask_key),
+            ("confidence_key", confidence_key),
+            ("alpha_pred_key", alpha_pred_key),
+            ("alpha_gt_key", alpha_gt_key),
+            ("alpha_valid_key", alpha_valid_key),
+            ("teacher_target_key", teacher_target_key),
+        ):
+            if not key:
+                raise ValueError(f"{name} must not be empty")
+
+        self.enable_teacher = bool(enable_teacher)
+        self.teacher_decay_epochs = int(teacher_decay_epochs)
+        self.teacher_mask_weight = float(teacher_mask_weight)
+        self.teacher_cwd_weight = float(teacher_cwd_weight)
+        self.teacher_mask_temperature = float(teacher_mask_temperature)
+        self.teacher_mask_dice_eps = float(teacher_mask_dice_eps)
+        self.teacher_mask_scale_weights = weights
+        self.cwd_temperature = float(cwd_temperature)
+        self.input_key = str(input_key)
+        self.clean_key = str(clean_key)
+        self.mask_key = str(mask_key)
+        self.confidence_key = str(confidence_key)
+        self.alpha_pred_key = str(alpha_pred_key)
+        self.alpha_gt_key = str(alpha_gt_key)
+        self.alpha_valid_key = str(alpha_valid_key)
+        self.teacher_target_key = str(teacher_target_key)
+        self._epoch: int | None = None
+
+        if int(student_h8_channels) != int(teacher_h8_channels):
+            self.cwd_h8_adapter: nn.Conv2d | None = nn.Conv2d(
+                int(student_h8_channels),
+                int(teacher_h8_channels),
+                kernel_size=1,
+                bias=False,
+            )
+        else:
+            self.cwd_h8_adapter = None
+
+        #: The trainer can use this to build StudentStage1Output.
+        self.forward_fn = run_student_stage1
+
+    # ------------------------------------------------------------------
+    # Schedule
+    # ------------------------------------------------------------------
+
+    def set_epoch(self, epoch: int) -> None:
+        """Record the 0-based training epoch for the teacher decay."""
+        epoch = int(epoch)
+        if epoch < 0:
+            raise ValueError(f"epoch must be non-negative, got {epoch}")
+        self._epoch = epoch
+
+    @property
+    def epoch(self) -> int:
+        """The stored epoch (0 until :meth:`set_epoch` is called)."""
+        return 0 if self._epoch is None else self._epoch
+
+    @property
+    def teacher_weight(self) -> float:
+        """Linear teacher weight for the current epoch, exactly 0 when done."""
+        if not self.enable_teacher:
+            return 0.0
+        if self.epoch >= self.teacher_decay_epochs:
+            return 0.0
+        return 1.0 - float(self.epoch) / float(self.teacher_decay_epochs)
+
+    @property
+    def teacher_detached(self) -> bool:
+        """True once the auxiliary weight has reached zero."""
+        return self.teacher_weight == 0.0
+
+    @property
+    def teacher_active(self) -> bool:
+        """Whether a training forward currently uses the teacher auxiliary."""
+        return bool(self.training and self.teacher_weight > 0.0)
+
+    @property
+    def teacher(self) -> Callable[..., object] | None:
+        """The configured online teacher, if any."""
+        return self._teacher_source
+
+    def set_progress(self, step: float, total: float) -> None:
+        """Forward the trainer's progress hook to the supervised criterion."""
+        setter = getattr(self.supervised, "set_progress", None)
+        if callable(setter):
+            setter(step, total)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        outputs: StudentStage1Output,
+        batch: Mapping[str, object],
+    ) -> dict[str, Tensor]:
+        """Combine supervised GT terms with the decaying teacher auxiliary."""
+        if not isinstance(outputs, StudentStage1Output):
+            raise TypeError(
+                "OneStageLoss expects a StudentStage1Output from "
+                "run_student_stage1 (the v1 forward tuple returns "
+                "probabilities and no H/8 feature), got "
+                f"{type(outputs).__name__}"
+            )
+        if not isinstance(batch, Mapping):
+            raise TypeError(
+                "OneStageLoss expects a mapping batch with GT and optional "
+                f"teacher entries, got {type(batch).__name__}"
+            )
+
+        clean = _require_4d(
+            "clean", self._batch_value(batch, self.clean_key)
+        )
+        mask = _require_tensor(
+            "mask", self._batch_value(batch, self.mask_key)
+        )
+        confidence = batch.get(self.confidence_key)
+        if confidence is not None:
+            confidence = _require_tensor(self.confidence_key, confidence)
+        alpha_pred = batch.get(self.alpha_pred_key)
+        if alpha_pred is not None:
+            alpha_pred = _require_tensor(self.alpha_pred_key, alpha_pred)
+        alpha_gt = batch.get(self.alpha_gt_key)
+        if alpha_gt is not None:
+            alpha_gt = _require_tensor(self.alpha_gt_key, alpha_gt)
+        alpha_valid = batch.get(self.alpha_valid_key)
+
+        supervised = self.supervised(
+            outputs.refine_bg,
+            outputs.coarse_bg,
+            outputs.mask_logits,
+            clean,
+            mask,
+            alpha_pred=alpha_pred,
+            alpha_gt=alpha_gt,
+            alpha_valid=alpha_valid,
+            confidence=confidence,
+        )
+        if not isinstance(supervised, Mapping) or "total" not in supervised:
+            raise TypeError(
+                "the supervised Stage2Loss must return a mapping with a "
+                "'total' entry"
+            )
+        supervised_total = supervised["total"]
+
+        zero = _zero(outputs.refine_bg)
+        teacher_mask = zero
+        teacher_mask_bce = zero
+        teacher_mask_dice = zero
+        teacher_cwd_h8 = zero
+        teacher_total = zero
+        effective_weight = 0.0
+
+        if self.teacher_active:
+            target = self._resolve_teacher_target(batch)
+            if self.teacher_mask_weight > 0.0:
+                teacher_mask_bce, teacher_mask_dice = (
+                    self._teacher_mask_loss(outputs.mask_logits, target)
+                )
+                teacher_mask = teacher_mask_bce + teacher_mask_dice
+            if self.teacher_cwd_weight > 0.0:
+                teacher_cwd_h8 = self._teacher_cwd_h8(
+                    outputs.feature_h8, target
+                )
+            effective_weight = self.teacher_weight
+            teacher_total = effective_weight * (
+                self.teacher_mask_weight * teacher_mask
+                + self.teacher_cwd_weight * teacher_cwd_h8
+            )
+
+        total = supervised_total + teacher_total
+        result: dict[str, Tensor] = {
+            "loss": total,
+            "total": total,
+            "supervised": supervised_total,
+            "teacher": teacher_total,
+            "teacher_mask": teacher_mask,
+            "teacher_mask_bce": teacher_mask_bce,
+            "teacher_mask_dice": teacher_mask_dice,
+            "teacher_cwd_h8": teacher_cwd_h8,
+            "teacher_weight": outputs.refine_bg.new_tensor(
+                float(effective_weight)
+            ),
+        }
+        for name, value in supervised.items():
+            if name not in result:
+                result[name] = value
+        return result
+
+    # ------------------------------------------------------------------
+    # Teacher target and regularizers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _batch_value(
+        batch: Mapping[str, object], key: str
+    ) -> object:
+        if key not in batch:
+            raise KeyError(
+                f"one-stage batch is missing {key!r}; available keys: "
+                f"{sorted(batch)}"
+            )
+        return batch[key]
+
+    def _resolve_teacher_target(
+        self, batch: Mapping[str, object]
+    ) -> TeacherTarget:
+        if self.teacher_target_key in batch:
+            cached = batch[self.teacher_target_key]
+            if cached is not None:
+                return _coerce_target(cached)
+
+        teacher = self._teacher_source
+        if teacher is None:
+            raise RuntimeError(
+                "the one-stage teacher auxiliary is active "
+                f"(epoch {self.epoch}, weight {self.teacher_weight:.3f}) but "
+                "no teacher target is available; pass teacher=... or "
+                f"batch[{self.teacher_target_key!r}]"
+            )
+        if not isinstance(teacher, nn.Module) and not callable(teacher):
+            raise TypeError(
+                "teacher must be callable, got "
+                f"{type(teacher).__name__}"
+            )
+        if self.input_key not in batch:
+            raise KeyError(
+                f"one-stage batch is missing the teacher input "
+                f"{self.input_key!r}"
+            )
+        images = _require_4d("teacher input", batch[self.input_key])
+        if isinstance(teacher, nn.Module):
+            teacher.eval()
+        with torch.no_grad():
+            target = teacher(images)
+        return _coerce_target(target)
+
+    def _teacher_mask_loss(
+        self,
+        student_logits: tuple[Tensor, Tensor, Tensor],
+        target: TeacherTarget,
+    ) -> tuple[Tensor, Tensor]:
+        levels = tuple(student_logits)
+        if len(levels) != len(_MASK_LEVEL_NAMES):
+            raise ValueError(
+                "student mask_logits must contain exactly three levels, got "
+                f"{len(levels)}"
+            )
+
+        device = levels[0].device
+        temperature = self.teacher_mask_temperature
+        bce_terms: list[Tensor] = []
+        dice_terms: list[Tensor] = []
+        with _autocast_disabled(device):
+            for name, divisor, student, teacher in zip(
+                _MASK_LEVEL_NAMES,
+                _MASK_LEVEL_DIVISORS,
+                levels,
+                target.mask_logits,
+            ):
+                student = _require_4d(
+                    f"student mask_logits[{name}]", student
+                ).float()
+                teacher = _require_4d(
+                    f"teacher mask_logits[{name}]", teacher
+                ).detach().to(device=device, dtype=torch.float32)
+                if student.shape[1] != 1 or teacher.shape[1] != 1:
+                    raise ValueError(
+                        f"mask level {name} must have 1 channel, got "
+                        f"{student.shape[1]} and {teacher.shape[1]}"
+                    )
+                if student.shape[0] != teacher.shape[0]:
+                    raise ValueError(
+                        f"mask level {name} batch mismatch: "
+                        f"{student.shape[0]} vs {teacher.shape[0]}"
+                    )
+                if student.shape[-2:] != teacher.shape[-2:]:
+                    raise ValueError(
+                        f"mask level {name} spatial mismatch: student "
+                        f"{tuple(student.shape[-2:])} vs teacher "
+                        f"{tuple(teacher.shape[-2:])} (divisor {divisor})"
+                    )
+
+                teacher_scaled = torch.sigmoid(teacher / temperature)
+                bce = (
+                    F.binary_cross_entropy_with_logits(
+                        student / temperature, teacher_scaled
+                    )
+                    * temperature
+                    * temperature
+                )
+                dice = _soft_dice(
+                    torch.sigmoid(student),
+                    torch.sigmoid(teacher),
+                    self.teacher_mask_dice_eps,
+                )
+                bce_terms.append(bce)
+                dice_terms.append(dice)
+
+        bce_total = _zero(levels[0])
+        dice_total = _zero(levels[0])
+        for weight, bce, dice in zip(
+            self.teacher_mask_scale_weights, bce_terms, dice_terms
+        ):
+            bce_total = bce_total + weight * bce
+            dice_total = dice_total + weight * dice
+        return bce_total, dice_total
+
+    def _teacher_cwd_h8(
+        self,
+        student: Tensor | None,
+        target: TeacherTarget,
+    ) -> Tensor:
+        if student is None:
+            raise RuntimeError(
+                "the one-stage H/8 teacher regularizer needs "
+                "StudentStage1Output.feature_h8; build outputs with "
+                "run_student_stage1"
+            )
+        student = _require_4d("student feature_h8", student)
+        teacher = _require_4d(
+            "teacher bottleneck_h8", target.bottleneck_h8
+        )
+        adapter = self.cwd_h8_adapter
+        if adapter is not None and student.shape[1] != adapter.in_channels:
+            raise ValueError(
+                f"student feature_h8 has {student.shape[1]} channels; the "
+                f"CWD adapter expects {adapter.in_channels}"
+            )
+
+        with _autocast_disabled(student.device):
+            if adapter is None:
+                adapted = student.float()
+            else:
+                adapted = _conv1x1_fp32(adapter, student)
+            teacher = teacher.detach().to(
+                device=adapted.device, dtype=torch.float32
+            )
+            if adapted.shape[1] != teacher.shape[1]:
+                raise ValueError(
+                    f"student feature_h8 has {adapted.shape[1]} channels "
+                    f"after adaptation; teacher has {teacher.shape[1]}"
+                )
+            if adapted.shape[0] != teacher.shape[0]:
+                raise ValueError(
+                    "feature_h8 batch mismatch: "
+                    f"{adapted.shape[0]} vs {teacher.shape[0]}"
+                )
+            adapted = _resize_to(adapted, teacher.shape[-2:])
+            return _cwd(adapted, teacher, self.cwd_temperature)
+
+    def extra_repr(self) -> str:
+        return (
+            f"teacher_decay_epochs={self.teacher_decay_epochs}, "
+            f"teacher_mask_weight={self.teacher_mask_weight}, "
+            f"teacher_cwd_weight={self.teacher_cwd_weight}, "
+            f"enable_teacher={self.enable_teacher}"
+        )
+
+
+def build_schedule_loss(args: Any) -> nn.Module:
+    """Build the CLI-selected schedule loss (``two_stage`` or ``one_stage``).
+
+    ``train_slbr_next.py`` exposes ``args.config`` (a ``TrainerConfig`` dict)
+    to loss factories; the new ``schedule`` and ``teacher_decay_epochs``
+    fields select the criterion. Both returned losses expose ``forward_fn``
+    (``run_student_stage1``) and are ready for the trainer's injected-loss
+    interface.
+    """
+    config = getattr(args, "config", None)
+    if isinstance(config, Mapping):
+        schedule = config.get("schedule") or "two_stage"
+        decay = config.get("teacher_decay_epochs") or 7
+    else:
+        schedule = (
+            getattr(config, "schedule", None)
+            or getattr(args, "schedule", None)
+            or "two_stage"
+        )
+        decay = (
+            getattr(config, "teacher_decay_epochs", None)
+            or getattr(args, "teacher_decay_epochs", None)
+            or 7
+        )
+
+    schedule = str(schedule).lower()
+    if schedule == "one_stage":
+        student_h8 = int(getattr(args, "student_h8_channels", 256) or 256)
+        teacher_h8 = int(getattr(args, "teacher_h8_channels", 256) or 256)
+        supervised_kwargs = None
+        if getattr(args, "perceptual", None) == "none":
+            supervised_kwargs = {"perceptual": None}
+        return OneStageLoss(
+            supervised_kwargs=supervised_kwargs,
+            teacher_decay_epochs=int(decay),
+            student_h8_channels=student_h8,
+            teacher_h8_channels=teacher_h8,
+        )
+    if schedule == "two_stage":
+        return TwoStageScheduleLoss()
+    raise ValueError(
+        "schedule must be 'two_stage' or 'one_stage', got "
+        f"{schedule!r}"
+    )
