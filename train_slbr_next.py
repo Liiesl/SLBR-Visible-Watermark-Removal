@@ -39,8 +39,13 @@ Compiled smoke (the exact T6 acceptance command)::
 The smoke runs the real ``SLBRNextV1`` at 256x256, batch 6/GPU, exercises
 DDP, FP16 autocast + GradScaler (T4), fused AdamW, channels_last, EMA,
 ``torch.compile`` fallback, and an atomic checkpoint save/resume. It prints
-one ``SMOKE_OK {...}`` JSON line with throughput and peak VRAM. After it
-passes, try ``--batch-size 8`` and ``--batch-size 10`` to find the OOM edge.
+``SMOKE_TIMING {...}`` (setup, model build, data, trainer init, first step,
+lazy compile, training, checkpoint/resume) followed by one ``SMOKE_OK {...}``
+JSON line with throughput and peak VRAM. On the compile path ``first_step_s``
+includes lazy Inductor compilation and ``compile_s`` isolates the first
+compiled forward; there is no compile timeout, and the existing
+catch-and-fallback remains active. After it passes, try ``--batch-size 8`` and
+``--batch-size 10`` to find the OOM edge.
 
 Real training::
 
