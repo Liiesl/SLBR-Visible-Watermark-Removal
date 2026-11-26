@@ -44,8 +44,15 @@ lazy compile, training, checkpoint/resume) followed by one ``SMOKE_OK {...}``
 JSON line with throughput and peak VRAM. On the compile path ``first_step_s``
 includes lazy Inductor compilation and ``compile_s`` isolates the first
 compiled forward; there is no compile timeout, and the existing
-catch-and-fallback remains active. After it passes, try ``--batch-size 8`` and
-``--batch-size 10`` to find the OOM edge.
+catch-and-fallback remains active. ``steady_state_steps_per_s`` excludes the
+first step. The §5.4 ~15% wall-clock fallback is a long-run operator decision:
+compare that steady-state number against ``--no-compile`` over a longer run;
+short smokes are compile-dominated by design. The smoke also enables per-step
+finite checks: a skipped AMP overflow is logged with ``grad_norm: null`` and
+``step_skipped: true``, then the run fails with ``SMOKE_FAILED`` rather than
+printing ``SMOKE_OK``. A clean ``SMOKE_OK`` therefore means parameters stayed
+finite and no unscaled Inf/NaN gradient was observed. After it passes, try
+``--batch-size 8`` and ``--batch-size 10`` to find the OOM edge.
 
 Real training::
 

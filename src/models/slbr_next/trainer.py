@@ -28,7 +28,9 @@ Features required by the T4 profile (§5.3, §5.4):
   epoch, in-epoch batch position, step, config, history and RNG state, so a
   resumed deterministic CPU run continues exactly where it stopped.
 * JSON config and JSONL metrics (step/epoch loss, LR, grad norm, samples/s,
-  peak VRAM).
+  peak VRAM). Grad-norm/overflow detection runs after ``GradScaler.unscale_``;
+  a non-finite step is skipped, logged as ``grad_norm: null`` /
+  ``step_skipped: true`` and counted instead of being reported as an Inf norm.
 
 Command lines
 -------------
@@ -152,6 +154,13 @@ class TrainerConfig:
     validate_ema: bool = True
     early_stop_patience: int = 0
     early_stop_min_delta: float = 0.0
+
+    # Numerical-safety checks (enabled by smoke_train, off by default so real
+    # training does not pay a per-step full-model finiteness scan).
+    #: Assert finite parameters after every step; with ``fail_on_overflow``,
+    #: a detected non-finite unscaled gradient fails the run after logging it.
+    finite_checks: bool = False
+    fail_on_overflow: bool = False
 
     # Checkpointing
     output_dir: str = "checkpoints/slbr_next"
@@ -718,6 +727,10 @@ class Trainer:
         self.best_metric: float | None = None
         self.bad_epochs = 0
         self.stopped_early = False
+        self.overflow_steps = 0
+        self.skipped_steps = 0
+        self.last_overflow_step: int | None = None
+        self.last_nonfinite_grad_params: list[str] = []
         self.history: list[dict[str, Any]] = []
         self.last_loss: float | None = None
         self.last_grad_norm: float | None = None
@@ -725,7 +738,7 @@ class Trainer:
         self.first_step_seconds: float | None = None
         self._epoch_loss_sum = 0.0
         self._epoch_batches = 0
-        self._last_components: dict[str, float] = {}
+        self._last_components: dict[str, float | None] = {}
 
         self.output_dir = Path(config.output_dir)
         self._setup_logging()
@@ -966,6 +979,64 @@ class Trainer:
         )
         return float(total)
 
+    def _gradients_are_finite(self) -> bool:
+        """Return False if any unscaled gradient is NaN/Inf.
+
+        Must be called after ``GradScaler.unscale_``; scaled gradient norms are
+        meaningless and can be large without indicating an overflow.
+        """
+        checks = [
+            torch.isfinite(parameter.grad).all()
+            for parameter in self.model.parameters()
+            if parameter.grad is not None
+        ]
+        if not checks:
+            return True
+        # One host sync per step instead of one per parameter.
+        return bool(torch.stack(checks).all())
+
+    def _nonfinite_gradient_names(self, limit: int = 5) -> list[str]:
+        """Names of the first parameters with non-finite gradients."""
+        names: list[str] = []
+        for name, parameter in self.raw_model.named_parameters():
+            if parameter.grad is None:
+                continue
+            if not bool(torch.isfinite(parameter.grad).all()):
+                names.append(name)
+                if len(names) >= limit:
+                    break
+        return names
+
+    def assert_finite_state(self, *, check_grads: bool = True) -> None:
+        """Raise ``FloatingPointError`` if model state is non-finite.
+
+        Smoke mode calls this after every step. ``check_grads=True`` asserts
+        the unscaled gradients before they are zeroed; an overflow step that
+        was skipped should pass with ``check_grads=False`` because its
+        parameters must remain unchanged and finite.
+        """
+        with torch.no_grad():
+            for name, parameter in self.raw_model.named_parameters():
+                if not bool(torch.isfinite(parameter).all()):
+                    raise FloatingPointError(
+                        f"non-finite parameter {name!r} "
+                        f"(shape {tuple(parameter.shape)})"
+                    )
+                if (
+                    check_grads
+                    and parameter.grad is not None
+                    and not bool(torch.isfinite(parameter.grad).all())
+                ):
+                    raise FloatingPointError(
+                        f"non-finite gradient {name!r} "
+                        f"(shape {tuple(parameter.grad.shape)})"
+                    )
+            for name, buffer in self.raw_model.named_buffers():
+                if buffer.is_floating_point() and not bool(
+                    torch.isfinite(buffer).all()
+                ):
+                    raise FloatingPointError(f"non-finite buffer {name!r}")
+
     def _train_step(self, batch: Any) -> None:
         batch = self._move_to_device(batch)
         inputs = self._extract_input(batch)
@@ -976,51 +1047,115 @@ class Trainer:
             outputs = self.model(inputs)
             loss_result = self.loss(outputs, batch)
             loss, components = self._split_loss_result(loss_result)
+        loss_value = self._as_float(loss)
+        loss_finite = math.isfinite(loss_value)
 
         self.scaler.scale(loss).backward()
+        # Unscale before any norm/finiteness check. Reporting the norm of
+        # scaled gradients would make ordinary FP16 scaling look like an
+        # overflow; an Inf below is a genuine unscaled NaN/Inf.
         self.scaler.unscale_(self.optimizer)
-        self.last_grad_norm = self.clip_gradients()
-        scale_before = self.scaler.get_scale()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        # GradScaler halves the scale when it skips an inf/NaN step; growth
-        # (after many finite steps) still means the update was applied.
-        stepped = (not self.scaler.is_enabled()) or (
-            self.scaler.get_scale() >= scale_before
-        )
-        self.optimizer.zero_grad(set_to_none=True)
+        grads_finite = self._gradients_are_finite()
+        amp_found_inf = not grads_finite
 
+        grad_norm: float | None = None
+        if grads_finite:
+            candidate = self.clip_gradients()
+            if math.isfinite(candidate):
+                grad_norm = candidate
+            else:
+                # Finite elements can still overflow the norm accumulator;
+                # treat that as an overflow and never log Infinity.
+                grads_finite = False
+        overflow = (not grads_finite) or (not loss_finite)
+        self.last_grad_norm = grad_norm
+        self.last_loss = loss_value if loss_finite else None
+        self.last_nonfinite_grad_params = (
+            self._nonfinite_gradient_names() if not grads_finite else []
+        )
+
+        if overflow:
+            self.overflow_steps += 1
+            self.last_overflow_step = self.global_step + 1
+            if self.scaler.is_enabled() and amp_found_inf:
+                # unscale_ already recorded found_inf; step() skips the
+                # optimizer update and update() decays the scale.
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            stepped = False
+            self.skipped_steps += 1
+        else:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            stepped = True
+
+        if self.config.finite_checks:
+            # Gradients are still unscaled and present here. An overflow step
+            # is allowed to have non-finite grads only because it was skipped;
+            # its parameters are checked below.
+            self.assert_finite_state(check_grads=not overflow)
+        self.optimizer.zero_grad(set_to_none=True)
         if stepped:
             self.ema.update(self.raw_model)
         self.scheduler.step()
 
         self.global_step += 1
-        loss_value = self._as_float(loss)
-        self.last_loss = loss_value
-        self._epoch_loss_sum += loss_value
+        if loss_finite:
+            self._epoch_loss_sum += loss_value
         self._epoch_batches += 1
 
         elapsed = time.perf_counter() - started
         if self.global_step == 1 and self.first_step_seconds is None:
             # On the compile path this includes lazy Inductor compilation.
             self.first_step_seconds = elapsed
-        if self.global_step % self.config.log_every == 0:
-            self._last_components = {
+        if overflow or self.global_step % self.config.log_every == 0:
+            # Always surface overflow steps even when log_every > 1.
+            component_values = {
                 name: self._as_float(value) for name, value in components.items()
             }
+            self._last_components = {
+                name: (value if math.isfinite(value) else None)
+                for name, value in component_values.items()
+            }
             samples = self._batch_size(batch) * self.world_size
+            reduced_loss = self._reduce_mean(loss_value)
+            if not math.isfinite(reduced_loss):
+                reduced_loss = None
             self._log(
                 {
                     "event": "step",
                     "epoch": self.epoch + 1,
                     "step": self.global_step,
-                    "loss": self._reduce_mean(loss_value),
+                    "loss": reduced_loss,
+                    "loss_finite": loss_finite,
                     "lr": self.last_lr,
                     "grad_norm": self.last_grad_norm,
+                    "grad_norm_finite": grad_norm is not None,
+                    "overflow": overflow,
+                    "step_skipped": not stepped,
+                    "overflow_steps": self.overflow_steps,
+                    "skipped_steps": self.skipped_steps,
+                    "nonfinite_grad_params": self.last_nonfinite_grad_params,
                     "samples_per_s": round(samples / max(elapsed, 1e-9), 2),
                     "vram_mb": self._peak_vram_mb(),
                     "components": self._last_components,
                 }
+            )
+
+        if self.config.finite_checks:
+            self.assert_finite_state(check_grads=False)
+            if stepped and not grads_finite:
+                raise FloatingPointError(
+                    "optimizer stepped with non-finite gradients at step "
+                    f"{self.global_step}"
+                )
+        if overflow and self.config.fail_on_overflow:
+            raise FloatingPointError(
+                "non-finite unscaled gradient or loss at step "
+                f"{self.global_step}; optimizer update skipped "
+                f"(overflow_steps={self.overflow_steps}, "
+                f"skipped_steps={self.skipped_steps}, "
+                f"nonfinite_grad_params={self.last_nonfinite_grad_params})"
             )
 
     # ------------------------------------------------------------------
@@ -1130,11 +1265,16 @@ class Trainer:
         ):
             metrics = self.validate()
 
+        reduced_train_loss = self._reduce_mean(train_loss)
+        if not math.isfinite(reduced_train_loss):
+            reduced_train_loss = None
         entry: dict[str, Any] = {
             "event": "epoch",
             "epoch": self.epoch,
             "step": self.global_step,
-            "train_loss": self._reduce_mean(train_loss),
+            "train_loss": reduced_train_loss,
+            "overflow_steps": self.overflow_steps,
+            "skipped_steps": self.skipped_steps,
         }
         entry.update(metrics)
         self.history.append(entry)
@@ -1272,6 +1412,9 @@ class Trainer:
             "epoch_batches": self._epoch_batches,
             "best_metric": self.best_metric,
             "bad_epochs": self.bad_epochs,
+            "overflow_steps": self.overflow_steps,
+            "skipped_steps": self.skipped_steps,
+            "last_overflow_step": self.last_overflow_step,
             "history": self.history,
             "world_size": self.world_size,
             "parameters": self._parameter_count(),
@@ -1351,6 +1494,12 @@ class Trainer:
         self._epoch_batches = int(checkpoint.get("epoch_batches", 0))
         self.best_metric = checkpoint.get("best_metric", None)
         self.bad_epochs = int(checkpoint.get("bad_epochs", 0))
+        self.overflow_steps = int(checkpoint.get("overflow_steps", 0))
+        self.skipped_steps = int(checkpoint.get("skipped_steps", 0))
+        last_overflow_step = checkpoint.get("last_overflow_step", None)
+        self.last_overflow_step = (
+            None if last_overflow_step is None else int(last_overflow_step)
+        )
         self.history = list(checkpoint.get("history", []))
         self.stopped_early = False
 
@@ -1490,10 +1639,21 @@ def smoke_train(
     compile path ``first_step_s`` includes lazy Inductor compilation and
     ``compile_s`` isolates the first compiled forward; there is no compile
     timeout because interrupting Inductor cannot be done safely, but the
-    catch-and-fallback path remains active.
+    catch-and-fallback path remains active. ``steady_state_steps_per_s``
+    excludes that first step. The §5.4 ~15% wall-clock fallback is a
+    long-run operator decision, not an automatic smoke behavior: compare
+    ``steady_state_steps_per_s`` against ``--no-compile`` over a longer run
+    and drop compile if it does not win; short smokes are dominated by
+    ``compile_s`` by design.
 
     The process group is destroyed in ``finally`` on success and failure when
     this function created it; an externally created group is left alone.
+
+    Smoke enables per-step finite checks and ``fail_on_overflow``: a skipped
+    non-finite gradient/loss is logged with ``grad_norm: null``,
+    ``overflow: true`` and ``step_skipped: true``, then raises and prints
+    ``SMOKE_FAILED``. ``SMOKE_OK`` therefore means no unscaled Inf/NaN was
+    observed and all parameters remain finite.
 
     Returns a JSON-serializable report. Synchronous units: ``steps`` are
     optimizer steps per rank, ``batch_size`` is images per GPU.
@@ -1520,6 +1680,8 @@ def smoke_train(
         save_best=False,
         save_every_epoch=False,
         save_on_exit=False,
+        finite_checks=True,
+        fail_on_overflow=True,
     )
 
     smoke_started = time.perf_counter()
@@ -1579,6 +1741,8 @@ def smoke_train(
         checkpoint = trainer.save_checkpoint()
         # Verify the resume path without allocating a second model.
         trainer.resume(checkpoint)
+        # Final gate: SMOKE_OK must never describe non-finite parameters.
+        trainer.assert_finite_state(check_grads=False)
         checkpoint_done = time.perf_counter()
 
         train_seconds = max(train_done - trainer_done, 1e-9)
@@ -1628,6 +1792,11 @@ def smoke_train(
             "parameters": trainer._parameter_count(),
             "final_loss": trainer.last_loss,
             "peak_vram_mb": trainer._peak_vram_mb(),
+            "overflow_steps": trainer.overflow_steps,
+            "skipped_steps": trainer.skipped_steps,
+            "last_overflow_step": trainer.last_overflow_step,
+            "nonfinite_grad_params": trainer.last_nonfinite_grad_params,
+            "numerically_clean": trainer.overflow_steps == 0,
             "timing": timing,
             "checkpoint": str(checkpoint),
         }
@@ -1640,17 +1809,34 @@ def smoke_train(
         return report
     except Exception as exc:
         if rank == 0:
+            failure: dict[str, Any] = {
+                "elapsed_s": round(time.perf_counter() - smoke_started, 3),
+                "error": str(exc),
+            }
+            failed_trainer = locals().get("trainer")
+            if failed_trainer is not None:
+                failure.update(
+                    {
+                        "first_step_s": (
+                            None
+                            if failed_trainer.first_step_seconds is None
+                            else round(failed_trainer.first_step_seconds, 3)
+                        ),
+                        "compile_s": (
+                            None
+                            if failed_trainer.compile_seconds is None
+                            else round(failed_trainer.compile_seconds, 3)
+                        ),
+                        "overflow_steps": failed_trainer.overflow_steps,
+                        "skipped_steps": failed_trainer.skipped_steps,
+                        "nonfinite_grad_params": (
+                            failed_trainer.last_nonfinite_grad_params
+                        ),
+                    }
+                )
             print(
                 "SMOKE_FAILED "
-                + json.dumps(
-                    {
-                        "elapsed_s": round(
-                            time.perf_counter() - smoke_started, 3
-                        ),
-                        "error": str(exc),
-                    },
-                    sort_keys=True,
-                ),
+                + json.dumps(failure, sort_keys=True),
                 flush=True,
             )
         raise

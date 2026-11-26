@@ -84,6 +84,28 @@ class TinyLoss(nn.Module):
         return {"loss": l1, "l1": l1.detach()}
 
 
+class _InfiniteGradient(torch.autograd.Function):
+    """Finite forward value with an Inf backward gradient."""
+
+    @staticmethod
+    def forward(ctx, value: torch.Tensor) -> torch.Tensor:
+        del ctx
+        return value * 0.0
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        del ctx
+        return torch.full_like(grad_output, float("inf"))
+
+
+class InfGradientLoss(nn.Module):
+    """Returns a finite zero loss but poisons the gradient with Inf."""
+
+    def forward(self, outputs: torch.Tensor, batch) -> torch.Tensor:
+        del batch
+        return _InfiniteGradient.apply(outputs).sum()
+
+
 def _loader(
     length: int = 4,
     batch_size: int = 1,
@@ -405,6 +427,80 @@ def test_compile_falls_back_to_eager(monkeypatch, tmp_path: Path) -> None:
     # even when compilation falls back before the first compiled forward.
     assert trainer.first_step_seconds is not None
     assert trainer.compile_seconds is not None
+
+
+def test_overflow_skips_optimizer_and_reports_finite_metrics(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        tmp_path,
+        max_steps=1,
+        finite_checks=True,
+        fail_on_overflow=False,
+        lr=1e-2,
+    )
+    model = TinyModel()
+    initial = {
+        name: value.detach().clone() for name, value in model.state_dict().items()
+    }
+    trainer = Trainer(
+        model=model,
+        loss=InfGradientLoss(),
+        train_loader=_loader(length=1),
+        config=config,
+    )
+
+    trainer.train(max_steps=1)
+
+    assert trainer.overflow_steps == 1
+    assert trainer.skipped_steps == 1
+    assert trainer.last_overflow_step == 1
+    assert trainer.last_grad_norm is None
+    assert trainer.last_loss == 0.0
+    assert not trainer.optimizer.state
+    for name, value in trainer.raw_model.state_dict().items():
+        assert torch.equal(value, initial[name]), name
+    trainer.assert_finite_state(check_grads=False)
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "train_log.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    step = [record for record in records if record["event"] == "step"][-1]
+    assert step["grad_norm"] is None
+    assert step["grad_norm_finite"] is False
+    assert step["loss_finite"] is True
+    assert step["overflow"] is True
+    assert step["step_skipped"] is True
+    assert step["overflow_steps"] == 1
+    assert step["skipped_steps"] == 1
+    assert step["nonfinite_grad_params"]
+    assert math.isfinite(step["loss"])
+
+
+def test_fail_on_overflow_blocks_smoke_ok(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path / "strict",
+        max_steps=1,
+        finite_checks=True,
+        fail_on_overflow=True,
+    )
+    trainer = Trainer(
+        model=TinyModel(),
+        loss=InfGradientLoss(),
+        train_loader=_loader(length=1),
+        config=config,
+    )
+
+    with pytest.raises(FloatingPointError, match="optimizer update skipped"):
+        trainer.train(max_steps=1)
+
+    assert trainer.overflow_steps == 1
+    assert trainer.skipped_steps == 1
+    assert not trainer.optimizer.state
+    trainer.assert_finite_state(check_grads=False)
 
 
 def test_smoke_loss_bce_is_autocast_safe(monkeypatch) -> None:
