@@ -415,7 +415,7 @@ def test_input_validation(monkeypatch):
     encoder, _ = _small_encoder(monkeypatch)
 
     with pytest.raises(ValueError):
-        encoder(torch.randn(1, 3, 64, 80))  # 80 is not a multiple of 16
+        encoder(torch.randn(1, 3, 64, 72))  # 72 is not a multiple of 16
     with pytest.raises(ValueError):
         encoder(torch.randn(1, 1, 64, 96))  # not RGB
     with pytest.raises(ValueError):
