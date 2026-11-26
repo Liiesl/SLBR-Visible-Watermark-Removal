@@ -366,7 +366,7 @@ def test_masked_cross_attention_updates_both_streams():
     probabilities = torch.softmax(part_logits.flatten(2), dim=1)
     torch.testing.assert_close(
         probabilities.sum(dim=1),
-        torch.ones(2, 8, 10),
+        torch.ones(2, 80),
         rtol=0.0,
         atol=1e-5,
     )

@@ -440,7 +440,9 @@ class _DecoderUpsample(nn.Module):
 
         if skip is not None:
             projected = self.skip_proj(skip)
-            gate = torch.sigmoid(self.skip_norm(projected))
+            gate = torch.sigmoid(
+                self.skip_gate(self.skip_norm(projected))
+            )
             x = x + gate * projected
         return x
 
