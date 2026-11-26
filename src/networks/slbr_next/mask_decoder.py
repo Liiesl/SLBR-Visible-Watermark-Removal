@@ -39,7 +39,7 @@ Invariants (spec §1.3)
 * No shape reversals; every interpolation receives an explicit
   ``size=reference.shape[2:]`` (or the exact doubled H/8 size when the
   optional reference skip is omitted), with ``align_corners=False``.
-* Every attention projection and decoder-upsample 1x1 projection,
+* Every attention projection, decoder-upsample 1x1 projection, NAF stem,
   normalization, softmax and logsumexp subtraction runs in FP32 with
   autocast disabled and is cast back to the activation dtype. This keeps
   FP16 projection weight gradients finite while preserving the output
@@ -559,6 +559,28 @@ class _DecoderUpsample(nn.Module):
         )
 
 
+class _FP32NAFBlock(NAFConvNeXtBlock):
+    """NAF block that executes in FP32 under autocast.
+
+    Used for the mask-decoder stem. The one-stage 2xT4 A/B smoke overflowed on
+    ``mask_decoder.stem.mixer_project.weight`` while the loss stayed finite:
+    the stem's projections were autocast FP16 convolutions, so their scaled
+    weight gradients accumulated in FP16. The block layout, parameter names
+    and parameter count are inherited unchanged; only execution precision
+    differs. An explicit half/bfloat16 model keeps its original dtype path so
+    parameter storage and activations stay consistent.
+    """
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.project_conv.weight.dtype != torch.float32:
+            return super().forward(x)
+
+        activation_dtype = x.dtype
+        with _fp32_autocast(x.device):
+            out = super().forward(x.float())
+        return out.to(dtype=activation_dtype)
+
+
 class MaskDecoder(nn.Module):
     """K-query mask decoder (spec §3.5).
 
@@ -674,7 +696,7 @@ class MaskDecoder(nn.Module):
                 in_channels, widths[0], kernel_size=1
             )
 
-        self.stem = NAFConvNeXtBlock(
+        self.stem = _FP32NAFBlock(
             widths[0],
             dw_kernel_size=dw_kernel_sizes[0],
             eps=eps,

@@ -426,6 +426,73 @@ def test_attention_bf16_autocast_stress_keeps_kv_grad_finite():
         assert torch.isfinite(parameter.grad).all(), name
 
 
+def test_mask_decoder_stem_runs_fp32_and_keeps_mixer_grad_finite():
+    """Regression for the one-stage A/B smoke overflow at step 3.
+
+    The failing parameter was ``mask_decoder.stem.mixer_project.weight``. On
+    the pre-fix code the NAF stem ran inside autocast, so the stem convs see
+    reduced-precision inputs and ``autocast_enabled=True`` here. On the fixed
+    code the whole stem executes in FP32 with autocast disabled and casts its
+    output back to the activation dtype, so every stem parameter -- including
+    ``mixer_project`` -- accumulates a finite FP32 gradient.
+    """
+    torch.manual_seed(0)
+    decoder = _tiny_decoder()
+    stem = decoder.stem
+
+    calls: dict[str, tuple[torch.dtype, bool]] = {}
+
+    def record(name):
+        def hook(module, args):
+            del module
+            calls[name] = (args[0].dtype, _autocast_cpu_enabled())
+
+        return hook
+
+    probes = {
+        "expand_conv": stem.expand_conv,
+        "dwconv": stem.dwconv,
+        "sca": stem.sca.conv,
+        "project_conv": stem.project_conv,
+        "mixer_expand": stem.mixer_expand,
+        "mixer_project": stem.mixer_project,
+    }
+    handles = [
+        module.register_forward_pre_hook(record(name))
+        for name, module in probes.items()
+    ]
+
+    features = (
+        torch.randn(2, TINY_WIDTHS[0], 32, 32) * 1e2
+    ).requires_grad_(True)
+    try:
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            out = stem(features)
+            assert out.dtype == features.dtype
+            assert torch.isfinite(out.float()).all()
+            # Match the gate's initial GradScaler magnitude.
+            loss = out.float().square().mean() * 65536.0
+        loss.backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert set(calls) == set(probes)
+    for name, (dtype, autocast_enabled) in calls.items():
+        assert dtype == torch.float32, name
+        assert autocast_enabled is False, name
+
+    assert stem.mixer_project.weight.grad is not None
+    assert torch.isfinite(stem.mixer_project.weight.grad).all()
+    assert stem.mixer_project.bias.grad is not None
+    assert torch.isfinite(stem.mixer_project.bias.grad).all()
+    for name, parameter in stem.named_parameters():
+        assert parameter.grad is not None, f"missing gradient for {name}"
+        assert torch.isfinite(parameter.grad).all(), name
+    assert features.grad is not None
+    assert torch.isfinite(features.grad).all()
+
+
 # ---------------------------------------------------------------------------
 # Attention mechanics
 # ---------------------------------------------------------------------------
