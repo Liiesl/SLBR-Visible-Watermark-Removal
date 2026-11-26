@@ -401,6 +401,55 @@ def test_compile_falls_back_to_eager(monkeypatch, tmp_path: Path) -> None:
     assert trainer.compile_fallback is True
     assert trainer.last_loss is not None
     assert math.isfinite(trainer.last_loss)
+    # Smoke timing plumbing: the first step and the compile attempt are timed
+    # even when compilation falls back before the first compiled forward.
+    assert trainer.first_step_seconds is not None
+    assert trainer.compile_seconds is not None
+
+
+def test_smoke_loss_bce_is_autocast_safe(monkeypatch) -> None:
+    """The smoke BCE must run in FP32 with autocast disabled (old code raised).
+
+    ``SLBRNextV1.forward`` returns probabilities, so the fix is an explicit
+    FP32/no-autocast BCE rather than switching to logits. CPU BF16 autocast
+    reproduces the same PyTorch safety guard on the hosted CI runner. The
+    wrapper also records the autocast state at the BCE call so the regression
+    is explicit even if a future torch version changes the guard.
+    """
+    calls: dict[str, object] = {}
+    original_bce = F.binary_cross_entropy
+
+    def checked_bce(prediction, target, **kwargs):
+        try:
+            calls["autocast_cpu"] = torch.is_autocast_enabled("cpu")
+        except TypeError:  # pragma: no cover - older torch signature
+            calls["autocast_cpu"] = torch.is_autocast_cpu_enabled()
+        calls["dtype"] = prediction.dtype
+        return original_bce(prediction, target, **kwargs)
+
+    monkeypatch.setattr(F, "binary_cross_entropy", checked_bce)
+
+    torch.manual_seed(0)
+    refine = torch.rand(2, 3, 16, 16, requires_grad=True)
+    coarse = torch.rand(2, 3, 16, 16, requires_grad=True)
+    masks = [
+        torch.rand(2, 1, 16, 16, requires_grad=True),
+        torch.rand(2, 1, 8, 8, requires_grad=True),
+        torch.rand(2, 1, 4, 4, requires_grad=True),
+    ]
+    mask_gt = torch.zeros(2, 1, 16, 16)
+    mask_gt[:, :, 4:10, 4:10] = 1.0
+    batch = {"clean": torch.rand(2, 3, 16, 16), "mask": mask_gt}
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        result = _trainer._smoke_loss(([refine, coarse], masks, [None]), batch)
+
+    assert calls["autocast_cpu"] is False
+    assert calls["dtype"] == torch.float32
+    assert torch.isfinite(result["loss"])
+    result["loss"].backward()
+    assert refine.grad is not None
+    assert torch.isfinite(refine.grad).all()
 
 
 def test_channels_last_smoke(tmp_path: Path) -> None:

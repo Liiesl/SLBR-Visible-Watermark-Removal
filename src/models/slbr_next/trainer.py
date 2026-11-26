@@ -542,29 +542,40 @@ class _CompileWithFallback(nn.Module):
         self.mode = mode
         self._compiled: nn.Module | None = None
         self.fallback = False
+        #: Wall time of the first compiled forward. Inductor compiles lazily
+        #: on that call, so this is where a multi-minute compile shows up.
+        self.compile_seconds: float | None = None
 
     def forward(self, *args: Any, **kwargs: Any):
         if self.fallback:
             return self.module(*args, **kwargs)
         if self._compiled is None:
+            created = time.perf_counter()
             try:
                 self._compiled = torch.compile(self.module, mode=self.mode)
             except Exception as exc:  # pragma: no cover - depends on torch build
                 self.fallback = True
+                self.compile_seconds = time.perf_counter() - created
                 LOGGER.warning(
                     "torch.compile failed at first use; falling back to eager: %s",
                     exc,
                 )
                 return self.module(*args, **kwargs)
+        started = time.perf_counter()
         try:
-            return self._compiled(*args, **kwargs)
+            result = self._compiled(*args, **kwargs)
         except Exception as exc:  # pragma: no cover - depends on torch build
+            if self.compile_seconds is None:
+                self.compile_seconds = time.perf_counter() - started
             self.fallback = True
             LOGGER.warning(
                 "compiled forward failed; falling back to eager and retrying: %s",
                 exc,
             )
             return self.module(*args, **kwargs)
+        if self.compile_seconds is None:
+            self.compile_seconds = time.perf_counter() - started
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +722,7 @@ class Trainer:
         self.last_loss: float | None = None
         self.last_grad_norm: float | None = None
         self.last_lr: float | None = None
+        self.first_step_seconds: float | None = None
         self._epoch_loss_sum = 0.0
         self._epoch_batches = 0
         self._last_components: dict[str, float] = {}
@@ -805,6 +817,11 @@ class Trainer:
         return bool(
             self._compile_wrapper is not None and self._compile_wrapper.fallback
         )
+
+    @property
+    def compile_seconds(self) -> float | None:
+        """First compiled-forward wall time (includes lazy Inductor compile)."""
+        return getattr(self._compile_wrapper, "compile_seconds", None)
 
     # ------------------------------------------------------------------
     # Logging
@@ -984,6 +1001,9 @@ class Trainer:
         self._epoch_batches += 1
 
         elapsed = time.perf_counter() - started
+        if self.global_step == 1 and self.first_step_seconds is None:
+            # On the compile path this includes lazy Inductor compilation.
+            self.first_step_seconds = elapsed
         if self.global_step % self.config.log_every == 0:
             self._last_components = {
                 name: self._as_float(value) for name, value in components.items()
@@ -1415,6 +1435,25 @@ class _SyntheticWatermarkDataset(Dataset):
         return {"image": image, "clean": image.clone(), "mask": mask}
 
 
+def _bce_probabilities_fp32(
+    prediction: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    """Run probability BCE in FP32 with autocast disabled.
+
+    ``SLBRNextV1.forward`` returns sigmoid probabilities, not logits, so the
+    v1 smoke loss cannot switch to ``binary_cross_entropy_with_logits``
+    without reconstructing logits. ``F.binary_cross_entropy`` is unsafe under
+    AMP autocast (PyTorch raises even when the input is FP32); disable
+    autocast for this op and cast both sides to FP32. The probability-BCE
+    semantics and the existing ``1e-4`` clamp are unchanged.
+    """
+    with torch.autocast(device_type=prediction.device.type, enabled=False):
+        return F.binary_cross_entropy(
+            prediction.float().clamp(1e-4, 1.0 - 1e-4),
+            target.float(),
+        )
+
+
 def _smoke_loss(outputs: Any, batch: Mapping[str, Any]) -> dict[str, torch.Tensor]:
     (refine_bg, coarse_bg), mask_list, _ = outputs
     target = batch["clean"]
@@ -1423,9 +1462,7 @@ def _smoke_loss(outputs: Any, batch: Mapping[str, Any]) -> dict[str, torch.Tenso
     mask_gt = batch["mask"]
     for mask in mask_list:
         resized = F.interpolate(mask_gt, size=mask.shape[-2:], mode="area")
-        loss = loss + 0.1 * F.binary_cross_entropy(
-            mask.clamp(1e-4, 1.0 - 1e-4), resized
-        )
+        loss = loss + 0.1 * _bce_probabilities_fp32(mask, resized)
     return {"loss": loss, "l1": reconstruction.detach()}
 
 
@@ -1448,6 +1485,15 @@ def smoke_train(
         torchrun --nproc_per_node=2 train_slbr_next.py --smoke --steps 10 \\
             --batch-size 6 --size 256 --compile \\
             --output-dir /kaggle/working/slbr_next_smoke
+
+    The run prints ``SMOKE_TIMING {...}`` before ``SMOKE_OK {...}``. On the
+    compile path ``first_step_s`` includes lazy Inductor compilation and
+    ``compile_s`` isolates the first compiled forward; there is no compile
+    timeout because interrupting Inductor cannot be done safely, but the
+    catch-and-fallback path remains active.
+
+    The process group is destroyed in ``finally`` on success and failure when
+    this function created it; an externally created group is left alone.
 
     Returns a JSON-serializable report. Synchronous units: ``steps`` are
     optimizer steps per rank, ``batch_size`` is images per GPU.
@@ -1476,64 +1522,145 @@ def smoke_train(
         save_on_exit=False,
     )
 
+    smoke_started = time.perf_counter()
+    already_initialized = dist.is_available() and dist.is_initialized()
     rank, world_size, local_rank = init_distributed(enabled=config.ddp)
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-    seed_everything(config.seed, rank)
-
-    from src.networks.slbr_next import SLBRNextV1
-
-    model = SLBRNextV1(convnext_pretrained=convnext_pretrained)
-    dataset = _SyntheticWatermarkDataset(
-        length=steps * batch_size * world_size, size=size
+    owns_process_group = (
+        not already_initialized
+        and dist.is_available()
+        and dist.is_initialized()
     )
-    sampler = None
-    if world_size > 1:
-        sampler = DistributedSampler(
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        seed_everything(config.seed, rank)
+        setup_done = time.perf_counter()
+
+        from src.networks.slbr_next import SLBRNextV1
+
+        model = SLBRNextV1(convnext_pretrained=convnext_pretrained)
+        model_done = time.perf_counter()
+
+        dataset = _SyntheticWatermarkDataset(
+            length=steps * batch_size * world_size, size=size
+        )
+        sampler = None
+        if world_size > 1:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                drop_last=True,
+            )
+        loader = DataLoader(
             dataset,
-            num_replicas=world_size,
-            rank=rank,
+            batch_size=batch_size,
             shuffle=False,
+            sampler=sampler,
+            num_workers=workers,
+            pin_memory=torch.cuda.is_available(),
             drop_last=True,
         )
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        sampler=sampler,
-        num_workers=workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=True,
-    )
-    trainer = Trainer(
-        model=model,
-        loss=_smoke_loss,
-        train_loader=loader,
-        val_loader=None,
-        config=config,
-        device=device,
-    )
-    trainer.train()
-    checkpoint = trainer.save_checkpoint()
-    # Verify the resume path without allocating a second model.
-    trainer.resume(checkpoint)
+        data_done = time.perf_counter()
 
-    report: dict[str, Any] = {
-        "ok": True,
-        "steps": trainer.global_step,
-        "epoch": trainer.epoch,
-        "batch_size_per_gpu": batch_size,
-        "size": size,
-        "world_size": world_size,
-        "amp_dtype": str(trainer.amp_dtype).replace("torch.", ""),
-        "channels_last": config.channels_last,
-        "compile": config.compile,
-        "compile_fallback": trainer.compile_fallback,
-        "parameters": trainer._parameter_count(),
-        "final_loss": trainer.last_loss,
-        "peak_vram_mb": trainer._peak_vram_mb(),
-        "checkpoint": str(checkpoint),
-    }
-    if rank == 0:
-        print("SMOKE_OK " + json.dumps(report, sort_keys=True), flush=True)
-    return report
+        trainer = Trainer(
+            model=model,
+            loss=_smoke_loss,
+            train_loader=loader,
+            val_loader=None,
+            config=config,
+            device=device,
+        )
+        trainer_done = time.perf_counter()
+
+        trainer.train()
+        train_done = time.perf_counter()
+        checkpoint = trainer.save_checkpoint()
+        # Verify the resume path without allocating a second model.
+        trainer.resume(checkpoint)
+        checkpoint_done = time.perf_counter()
+
+        train_seconds = max(train_done - trainer_done, 1e-9)
+        timing: dict[str, Any] = {
+            "setup_s": round(setup_done - smoke_started, 3),
+            "model_build_s": round(model_done - setup_done, 3),
+            "data_s": round(data_done - model_done, 3),
+            "trainer_init_s": round(trainer_done - data_done, 3),
+            "train_s": round(train_seconds, 3),
+            "first_step_s": (
+                None
+                if trainer.first_step_seconds is None
+                else round(trainer.first_step_seconds, 3)
+            ),
+            "compile_s": (
+                None
+                if trainer.compile_seconds is None
+                else round(trainer.compile_seconds, 3)
+            ),
+            "checkpoint_resume_s": round(checkpoint_done - train_done, 3),
+            "total_s": round(checkpoint_done - smoke_started, 3),
+            "steps": trainer.global_step,
+            "steps_per_s": round(trainer.global_step / train_seconds, 4),
+        }
+        if (
+            timing["first_step_s"] is not None
+            and trainer.global_step > 1
+            and timing["train_s"] > timing["first_step_s"]
+        ):
+            timing["steady_state_steps_per_s"] = round(
+                (trainer.global_step - 1)
+                / (timing["train_s"] - timing["first_step_s"]),
+                4,
+            )
+
+        report: dict[str, Any] = {
+            "ok": True,
+            "steps": trainer.global_step,
+            "epoch": trainer.epoch,
+            "batch_size_per_gpu": batch_size,
+            "size": size,
+            "world_size": world_size,
+            "amp_dtype": str(trainer.amp_dtype).replace("torch.", ""),
+            "channels_last": config.channels_last,
+            "compile": config.compile,
+            "compile_fallback": trainer.compile_fallback,
+            "parameters": trainer._parameter_count(),
+            "final_loss": trainer.last_loss,
+            "peak_vram_mb": trainer._peak_vram_mb(),
+            "timing": timing,
+            "checkpoint": str(checkpoint),
+        }
+        if rank == 0:
+            print(
+                "SMOKE_TIMING " + json.dumps(timing, sort_keys=True),
+                flush=True,
+            )
+            print("SMOKE_OK " + json.dumps(report, sort_keys=True), flush=True)
+        return report
+    except Exception as exc:
+        if rank == 0:
+            print(
+                "SMOKE_FAILED "
+                + json.dumps(
+                    {
+                        "elapsed_s": round(
+                            time.perf_counter() - smoke_started, 3
+                        ),
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        raise
+    finally:
+        if (
+            owns_process_group
+            and dist.is_available()
+            and dist.is_initialized()
+        ):
+            try:
+                dist.destroy_process_group()
+            except Exception as exc:  # pragma: no cover - teardown best effort
+                LOGGER.warning("destroy_process_group() failed: %s", exc)
