@@ -39,8 +39,10 @@ Invariants (spec §1.3)
 * No shape reversals; every interpolation receives an explicit
   ``size=reference.shape[2:]`` (or the exact doubled H/8 size when the
   optional reference skip is omitted), with ``align_corners=False``.
-* Softmax and the logsumexp subtraction run in FP32 and are cast back to the
-  activation dtype, keeping FP16 logits finite.
+* Every attention projection, normalization, softmax and logsumexp
+  subtraction runs in FP32 with autocast disabled and is cast back to the
+  activation dtype. This keeps FP16 projection weight gradients finite while
+  preserving the output dtypes.
 """
 
 from __future__ import annotations
@@ -101,29 +103,6 @@ class MaskDecoderOutput:
     part_logits: Tensor      # raw K+1 part logits; full H, W
 
 
-def _pixel_query_scores(
-    features: Tensor,
-    queries: Tensor,
-    pixel_norm: nn.Module,
-    pixel_proj: nn.Module,
-    query_norm: nn.Module,
-    query_key: nn.Module,
-) -> Tensor:
-    """LayerNormed pixel-query similarity ``[B, Q, H * W]`` in FP32.
-
-    Both the pixel embedding and the query key are normalized per pixel by
-    LayerNorm, so the scaled dot product stays ``O(1)`` and finite in FP16.
-    """
-    pixel = pixel_norm(pixel_proj(features))
-    pixel = pixel.flatten(2)
-    query = query_key(query_norm(queries))
-
-    # The explicit 1/sqrt(D) scale keeps the logits well conditioned.
-    scores = torch.matmul(query.float(), pixel.float())
-    scores = scores * (pixel.shape[1] ** -0.5)
-    return scores.to(features.dtype)
-
-
 def _foreground_logits(part_logits: Tensor) -> Tensor:
     """``logsumexp(z_1..z_K) - z_bg`` from raw ``[B, K+1, H, W]`` scores.
 
@@ -143,6 +122,84 @@ def _foreground_logits(part_logits: Tensor) -> Tensor:
     return logits.to(part_logits.dtype)
 
 
+def _fp32_autocast(device: torch.device) -> torch.autocast:
+    """Disable autocast so enclosed projections execute in FP32."""
+    return torch.autocast(device_type=device.type, enabled=False)
+
+
+def _linear_fp32(x: Tensor, linear: nn.Linear) -> Tensor:
+    """FP32 linear that bypasses autocast and FP16 parameter storage.
+
+    Under autocast training the master weights are already FP32, so the
+    ``.float()`` calls are no-ops. Under an explicit ``.half()`` model they
+    still keep the projection (and its weight gradient) in FP32.
+    """
+    bias = None if linear.bias is None else linear.bias.float()
+    return F.linear(x.float(), linear.weight.float(), bias)
+
+
+def _conv2d_fp32(x: Tensor, conv: nn.Conv2d) -> Tensor:
+    """FP32 convolution that bypasses autocast and FP16 parameter storage.
+
+    ``kv_proj`` in particular previously ran as an autocast FP16 convolution;
+    its FP16 weight-gradient accumulation was the first tensor to go
+    non-finite in the 2xT4 smoke.
+    """
+    bias = None if conv.bias is None else conv.bias.float()
+    return F.conv2d(
+        x.float(),
+        conv.weight.float(),
+        bias,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=conv.groups,
+    )
+
+
+def _layer_norm_fp32(x: Tensor, norm: nn.LayerNorm) -> Tensor:
+    """FP32 LayerNorm over the last dimension, ignoring autocast."""
+    weight = None if norm.weight is None else norm.weight.float()
+    bias = None if norm.bias is None else norm.bias.float()
+    return F.layer_norm(
+        x.float(), norm.normalized_shape, weight, bias, norm.eps
+    )
+
+
+def _layer_norm_2d_fp32(x: Tensor, norm: LayerNorm2d) -> Tensor:
+    """FP32 :class:`LayerNorm2d` that returns channels-first FP32."""
+    y = x.float().permute(0, 2, 3, 1)
+    y = _layer_norm_fp32(y, norm.norm)
+    return y.permute(0, 3, 1, 2)
+
+
+def _pixel_query_scores(
+    features: Tensor,
+    queries: Tensor,
+    pixel_norm: nn.Module,
+    pixel_proj: nn.Module,
+    query_norm: nn.Module,
+    query_key: nn.Module,
+) -> Tensor:
+    """LayerNormed pixel-query similarity ``[B, Q, H * W]`` in FP32.
+
+    Both the pixel embedding and the query key are normalized per pixel by
+    LayerNorm, so the scaled dot product stays ``O(1)``. Every projection and
+    matmul is forced to FP32; callers must run this inside
+    :func:`_fp32_autocast` and cast the result back to the activation dtype.
+    """
+    pixel = _layer_norm_2d_fp32(
+        _conv2d_fp32(features, pixel_proj), pixel_norm
+    )
+    pixel = pixel.flatten(2)
+    query = _linear_fp32(_layer_norm_fp32(queries, query_norm), query_key)
+
+    # The explicit 1/sqrt(D) scale keeps the logits well conditioned.
+    scores = torch.matmul(query, pixel)
+    scores = scores * (pixel.shape[1] ** -0.5)
+    return scores
+
+
 class MaskedCrossAttention(nn.Module):
     """Masked query<->pixel cross-attention at one decoder scale.
 
@@ -157,8 +214,12 @@ class MaskedCrossAttention(nn.Module):
     similarity computation produces the raw part scores ``z_k`` returned to
     the caller.
 
-    All attention math (normalization, softmax, matmuls) runs in FP32 and the
-    results are cast back to the activation dtype.
+    All attention math -- LayerNorm, q/k/v and output projections, the
+    temperature scaling, the coarse-mask bias, both softmaxes and the
+    attention matmuls -- runs in FP32 with autocast explicitly disabled, then
+    the feature and part-logit outputs are cast back to the activation dtype.
+    This keeps the FP16 weight-gradient path finite without changing the
+    module interface.
 
     Args:
         channels: Mask feature width at this scale.
@@ -287,59 +348,83 @@ class MaskedCrossAttention(nn.Module):
             )
 
         batch, _, height, width = features.shape
+        activation_dtype = features.dtype
 
-        # --- Query -> pixel: masked softmax attention -------------------
-        coarse_prob = torch.sigmoid(
-            self.coarse_head(self.coarse_norm(features))
-        )
+        # Every projection, normalization, temperature/bias term, softmax and
+        # matmul below runs in FP32 with autocast disabled. ``kv_proj`` is the
+        # historical failure point: its weight gradient was accumulated in
+        # FP16 under autocast and went non-finite even when the loss was
+        # finite. The feature and part-logit outputs are cast back to the
+        # activation dtype so the decoder's memory/layout contract is
+        # unchanged.
+        with _fp32_autocast(features.device):
+            # --- Query -> pixel: masked softmax attention ---------------
+            coarse_prob = torch.sigmoid(
+                _conv2d_fp32(
+                    _layer_norm_2d_fp32(features, self.coarse_norm),
+                    self.coarse_head,
+                )
+            )
 
-        query = self.query_proj(self.query_norm(queries))
-        query = query.reshape(
-            batch, self.num_queries, self.heads, self.head_dim
-        ).permute(0, 2, 1, 3)
+            query = _linear_fp32(
+                _layer_norm_fp32(queries, self.query_norm),
+                self.query_proj,
+            )
+            query = query.reshape(
+                batch, self.num_queries, self.heads, self.head_dim
+            ).permute(0, 2, 1, 3)
 
-        key, value = self.kv_proj(self.feature_norm(features)).chunk(
-            2, dim=1
-        )
-        key = key.reshape(batch, self.heads, -1, self.head_dim)
-        value = value.reshape(batch, self.heads, -1, self.head_dim)
+            key, value = _conv2d_fp32(
+                _layer_norm_2d_fp32(features, self.feature_norm),
+                self.kv_proj,
+            ).chunk(2, dim=1)
+            key = key.reshape(batch, self.heads, -1, self.head_dim)
+            value = value.reshape(batch, self.heads, -1, self.head_dim)
 
-        logits = torch.matmul(query.float(), key.float().transpose(-2, -1))
-        logits = logits * self.temperature.float()
-        logits = logits + self.coarse_mask_bias(coarse_prob)
-        attention = logits.softmax(dim=-1)
+            logits = torch.matmul(query, key.transpose(-2, -1))
+            logits = logits * self.temperature.float()
+            logits = logits + self.coarse_mask_bias(coarse_prob)
+            attention = logits.softmax(dim=-1)
 
-        attended = torch.matmul(attention, value.float())
-        attended = attended.to(features.dtype)
-        attended = attended.permute(0, 2, 1, 3).reshape(
-            batch, self.num_queries, self.query_dim
-        )
-        queries = queries + self.out_proj(attended)
+            attended = torch.matmul(attention, value)
+            attended = attended.permute(0, 2, 1, 3).reshape(
+                batch, self.num_queries, self.query_dim
+            )
+            queries = queries.float() + _linear_fp32(
+                attended, self.out_proj
+            )
 
-        # --- Pixel -> query: part scores and spatial update -------------
-        part_logits = _pixel_query_scores(
-            features,
+            # --- Pixel -> query: part scores and spatial update ----------
+            part_logits = _pixel_query_scores(
+                features,
+                queries,
+                self.pixel_norm,
+                self.pixel_proj,
+                self.score_query_norm,
+                self.score_query_key,
+            )
+            probabilities = part_logits.softmax(dim=1)
+
+            values = _linear_fp32(
+                _layer_norm_fp32(queries, self.score_query_norm),
+                self.query_value,
+            )
+            update = torch.matmul(values.transpose(1, 2), probabilities)
+            update = update.reshape(
+                batch, self.channels, height, width
+            )
+            update = _conv2d_fp32(update, self.spatial_proj)
+            features = features.float() + update
+
+            part_logits = part_logits.reshape(
+                batch, self.num_queries, height, width
+            )
+
+        return (
+            features.to(activation_dtype),
             queries,
-            self.pixel_norm,
-            self.pixel_proj,
-            self.score_query_norm,
-            self.score_query_key,
+            part_logits.to(activation_dtype),
         )
-        probabilities = part_logits.float().softmax(dim=1)
-
-        values = self.query_value(
-            self.score_query_norm(queries)
-        ).float()
-        update = torch.matmul(values.transpose(1, 2), probabilities)
-        update = update.to(features.dtype).reshape(
-            batch, self.channels, height, width
-        )
-        features = features + self.spatial_proj(update)
-
-        part_logits = part_logits.reshape(
-            batch, self.num_queries, height, width
-        )
-        return features, queries, part_logits
 
     def extra_repr(self) -> str:
         return (
@@ -354,7 +439,9 @@ class PartScoreHead(nn.Module):
     A lightweight head for scales without a full cross-attention block
     (``H/2`` and ``H``). It returns the pre-softmax ``[B, K + 1, h, w]``
     scores used by the logsumexp foreground logit and the part-diversity
-    auxiliary loss.
+    auxiliary loss. As in :class:`MaskedCrossAttention`, the projections,
+    normalization and score matmul run in explicit FP32 and the scores are
+    cast back to the activation dtype.
 
     Args:
         channels: Feature width at this scale.
@@ -381,17 +468,19 @@ class PartScoreHead(nn.Module):
         self.query_key = nn.Linear(self.query_dim, self.query_dim)
 
     def forward(self, features: Tensor, queries: Tensor) -> Tensor:
-        scores = _pixel_query_scores(
-            features,
-            queries,
-            self.pixel_norm,
-            self.pixel_proj,
-            self.query_norm,
-            self.query_key,
-        )
+        activation_dtype = features.dtype
+        with _fp32_autocast(features.device):
+            scores = _pixel_query_scores(
+                features,
+                queries,
+                self.pixel_norm,
+                self.pixel_proj,
+                self.query_norm,
+                self.query_key,
+            )
         return scores.reshape(
             features.shape[0], queries.shape[1], *features.shape[2:]
-        )
+        ).to(activation_dtype)
 
     def extra_repr(self) -> str:
         return f"channels={self.channels}, query_dim={self.query_dim}"
