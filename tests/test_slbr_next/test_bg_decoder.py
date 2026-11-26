@@ -598,21 +598,16 @@ def test_interpolation_targets_reference_sizes(tiny_models, monkeypatch):
     )
 
     with torch.no_grad():
-        _run_decoder(decoder, inputs)
+        decoded = _run_decoder(decoder, inputs)
 
     expected = [(32, 64), (64, 128), (128, 256), (256, 512)]
     assert None not in recorded
     assert len(recorded) == len(expected)
     assert recorded == expected
 
-    with torch.no_grad():
-        decoded = _run_decoder(decoder, inputs)
-
+    # ``ResampleBlock`` lives in ``bg_decoder`` and uses that module's ``F``
+    # object, so the patch above already records the refinement calls too.
     recorded.clear()
-    monkeypatch.setattr(
-        "src.networks.slbr_next.refinement.F.interpolate",
-        recording_interpolate,
-    )
 
     with torch.no_grad():
         refiner(
