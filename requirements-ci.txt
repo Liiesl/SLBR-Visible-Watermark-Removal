@@ -2,6 +2,8 @@
 # in .github/workflows/ci.yml so Linux runners do not pull the CUDA build.
 numpy
 scipy
+# SLBR-Next's pretrained ConvNeXt V2 semantic branch.
+timm
 scikit-image
 scikit-learn
 opencv-python-headless
