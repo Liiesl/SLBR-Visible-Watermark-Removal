@@ -39,10 +39,11 @@ Invariants (spec §1.3)
 * No shape reversals; every interpolation receives an explicit
   ``size=reference.shape[2:]`` (or the exact doubled H/8 size when the
   optional reference skip is omitted), with ``align_corners=False``.
-* Every attention projection, normalization, softmax and logsumexp
-  subtraction runs in FP32 with autocast disabled and is cast back to the
-  activation dtype. This keeps FP16 projection weight gradients finite while
-  preserving the output dtypes.
+* Every attention projection and decoder-upsample 1x1 projection,
+  normalization, softmax and logsumexp subtraction runs in FP32 with
+  autocast disabled and is cast back to the activation dtype. This keeps
+  FP16 projection weight gradients finite while preserving the output
+  dtypes.
 """
 
 from __future__ import annotations
@@ -487,7 +488,15 @@ class PartScoreHead(nn.Module):
 
 
 class _DecoderUpsample(nn.Module):
-    """Bilinear -> 3x3 DWConv -> 1x1, with an optional gated skip."""
+    """Bilinear -> 3x3 DWConv -> 1x1, with an optional gated skip.
+
+    The 1x1 ``project`` runs in FP32 with autocast disabled. In the T5
+    one-stage FP16 gate its weight/bias gradients were non-finite while the
+    loss stayed finite: the projection was an autocast FP16 convolution, so
+    its scaled parameter gradients accumulated in FP16. This is the same
+    failure class as the attention ``kv_proj`` guard. The DWConv and the
+    gated-skip path stay in the activation dtype.
+    """
 
     def __init__(
         self,
@@ -525,7 +534,15 @@ class _DecoderUpsample(nn.Module):
             x, size=size, mode="bilinear", align_corners=False
         )
         x = self.dwconv(x)
-        x = self.project(x)
+        if self.project.weight.dtype != torch.float32:
+            # Explicitly half/bf16 models cannot mix FP32 weights with a
+            # half-precision activation under autocast-disabled execution.
+            x = self.project(x)
+        else:
+            activation_dtype = x.dtype
+            with _fp32_autocast(x.device):
+                x = self.project(x.float())
+            x = x.to(dtype=activation_dtype)
 
         if skip is not None:
             projected = self.skip_proj(skip)

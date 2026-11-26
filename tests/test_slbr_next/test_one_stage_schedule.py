@@ -223,6 +223,13 @@ def _one_stage(
     )
 
 
+def _autocast_cpu_enabled():
+    try:
+        return torch.is_autocast_enabled("cpu")
+    except TypeError:  # pragma: no cover - older torch signature
+        return torch.is_autocast_cpu_enabled()
+
+
 # ---------------------------------------------------------------------------
 # Decay schedule and hard detachment
 # ---------------------------------------------------------------------------
@@ -285,6 +292,19 @@ def test_teacher_weight_decays_linearly_to_exact_zero(modules):
             stage2.Stage2Loss,
             decay=0,
         )
+
+
+def test_teacher_mask_level_weights_are_normalized(modules):
+    one_stage = modules.losses_stage1
+    stage2 = modules.losses_stage2
+
+    criterion = _one_stage(one_stage.OneStageLoss, stage2.Stage2Loss)
+    weights = criterion.teacher_mask_scale_weights
+    assert sum(weights) == pytest.approx(1.0)
+    assert weights == pytest.approx((4.0 / 7.0, 2.0 / 7.0, 1.0 / 7.0))
+
+    # The relative H/H2/H4 ordering is preserved.
+    assert weights[0] > weights[1] > weights[2] > 0.0
 
 
 def test_teacher_forward_is_skipped_after_decay(modules):
@@ -436,6 +456,115 @@ def test_one_stage_has_no_teacher_output_imitation(modules):
 # ---------------------------------------------------------------------------
 # Frozen teacher, no normalization, and validation isolation
 # ---------------------------------------------------------------------------
+
+
+def test_one_stage_bf16_backward_keeps_projection_grads_finite(modules):
+    """Regression for the T5 one-stage 2xT4 FP16 failure.
+
+    The teacher mask/CWD math is already FP32, but the combined one-stage
+    loss drives the student's ``encoder.down1.project`` and
+    ``mask_decoder.up_h8_h4.project`` 1x1 convolutions hard enough that their
+    autocast FP16 weight/bias gradients overflowed. The fix runs those
+    projection ops in FP32 with autocast disabled.
+    """
+
+    from src.networks.slbr_next.encoder import HaarDownsample
+    from src.networks.slbr_next.mask_decoder import _DecoderUpsample
+
+    one_stage = modules.losses_stage1
+    stage2 = modules.losses_stage2
+    teacher = modules.teacher
+
+    class TinyProjectionModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stem = nn.Conv2d(3, 8, 3, padding=1)
+            self.encoder = nn.Module()
+            self.encoder.down1 = HaarDownsample(8, 16)
+            self.mask_decoder = nn.Module()
+            self.mask_decoder.up_h8_h4 = _DecoderUpsample(16, 8, 8)
+            self.image_head = nn.Conv2d(8, 3, 1)
+            self.mask_head = nn.Conv2d(8, 1, 1)
+            self.h8_head = nn.Conv2d(16, 16, 1)
+
+        def forward(self, x, output_cls):
+            x_h = self.stem(x)
+            x_h2 = self.encoder.down1(x_h)
+            features = self.mask_decoder.up_h8_h4(
+                x_h2, size=x_h.shape[-2:], skip=x_h
+            )
+            image = self.image_head(features)
+            logits = self.mask_head(features)
+            return output_cls(
+                refine_bg=torch.sigmoid(image),
+                coarse_bg=torch.sigmoid(image),
+                mask_logits=(
+                    logits,
+                    F.avg_pool2d(logits, 2),
+                    F.avg_pool2d(logits, 4),
+                ),
+                feature_h8=self.h8_head(F.avg_pool2d(x_h2, 4)),
+            )
+
+    height = width = 64
+    batch_size = 8
+    model = TinyProjectionModel()
+    target = _make_target(
+        teacher.TeacherTarget,
+        height=height,
+        width=width,
+        batch=batch_size,
+        h8_channels=16,
+    )
+    batch = _make_batch(
+        height=height,
+        width=width,
+        batch=batch_size,
+        teacher_target=target,
+    )
+    criterion = one_stage.OneStageLoss(
+        supervised=stage2.Stage2Loss(perceptual=None),
+        teacher_decay_epochs=7,
+        student_h8_channels=16,
+        teacher_h8_channels=16,
+    )
+
+    calls: dict[str, tuple[torch.dtype, bool]] = {}
+
+    def record(name):
+        def hook(module, args):
+            del module
+            calls[name] = (args[0].dtype, _autocast_cpu_enabled())
+
+        return hook
+
+    handles = [
+        model.encoder.down1.project.register_forward_pre_hook(
+            record("down1")
+        ),
+        model.mask_decoder.up_h8_h4.project.register_forward_pre_hook(
+            record("up_h8_h4")
+        ),
+    ]
+    x = torch.rand(batch_size, 3, height, width)
+    try:
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            outputs = model(x, one_stage.StudentStage1Output)
+            result = criterion(outputs, batch)
+            # Match the gate's initial GradScaler magnitude.
+            loss = result["loss"] * 65536.0
+        assert torch.isfinite(result["loss"]).all()
+        loss.backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert calls["down1"] == (torch.float32, False)
+    assert calls["up_h8_h4"] == (torch.float32, False)
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+    assert float(result["teacher"].detach()) > 0.0
 
 
 def test_module_teacher_is_frozen_eval_and_receives_raw_rgb(modules):
