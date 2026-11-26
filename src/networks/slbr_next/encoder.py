@@ -10,6 +10,12 @@ The encoder has two paths that meet at ``H/4``:
   1x1 convolutions. The branch receives ImageNet-normalized input internally;
   the stem sees the raw ``[0, 1]`` image.
 
+The semantic branch runs in FP32 with autocast explicitly disabled (spec
+§5.4). This covers its GRN layers and the stem/downsample/depthwise
+convolutions whose FP16 parameter gradients went non-finite in the 2xT4
+training gate. The branch only operates at ``H/4``-``H/16``, so its FP32
+cost is a small fraction of the full-resolution stem.
+
 The public interface is frozen for A3-A6::
 
     @dataclass(frozen=True)
@@ -335,30 +341,47 @@ class SLBRNextEncoder(nn.Module):
             )
 
         # The pretrained branch sees ImageNet-normalized input; the stem sees
-        # the raw [0, 1] image. Buffers follow .to(dtype/device).
-        mean = self.image_mean.to(dtype=x.dtype, device=x.device)
-        std = self.image_std.to(dtype=x.dtype, device=x.device)
-        branch_input = (x - mean) / std
-
-        branch_features = self.semantic_branch(branch_input)
-        if isinstance(branch_features, dict):
-            branch_features = list(branch_features.values())
-        branch_features = list(branch_features)
-        if len(branch_features) != 3:
-            raise RuntimeError(
-                "The timm feature branch must return three stages at "
-                f"H/4, H/8 and H/16, got {len(branch_features)}"
-            )
+        # the raw [0, 1] image. The branch and its 1x1 fusion projections run
+        # in FP32 with autocast disabled: the T6 2xT4 log shows the branch
+        # stem/downsample/depthwise convolution weights and biases are the
+        # first non-finite FP16 gradients, while the high-resolution stem is
+        # clean. FP32 covers GRN (spec §5.4) and removes FP16 convolution
+        # backward from the branch's small H/4-H/16 feature pyramid.
+        branch_param = next(self.semantic_branch.parameters(), None)
+        branch_dtype = (
+            branch_param.dtype if branch_param is not None else x.dtype
+        )
+        run_branch_fp32 = branch_dtype == torch.float32
+        mean = self.image_mean.to(dtype=branch_dtype, device=x.device)
+        std = self.image_std.to(dtype=branch_dtype, device=x.device)
+        branch_input = (x.to(dtype=branch_dtype) - mean) / std
 
         x_h = self.stem_stages[0](self.stem_conv(x))
         x_h2 = self.stem_stages[1](self.down1(x_h))
         stem_h4 = self.stem_stages[2](self.down2(x_h2))
 
-        x_h4 = self.fuse_h4(
-            torch.cat((stem_h4, branch_features[0]), dim=1)
-        )
-        x_h8 = self.fuse_h8(branch_features[1])
-        x_h16 = self.fuse_h16(branch_features[2])
+        if run_branch_fp32:
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                branch_features = self.semantic_branch(branch_input)
+                branch_features = self._check_branch_features(branch_features)
+
+                x_h4 = self.fuse_h4(
+                    torch.cat((stem_h4.float(), branch_features[0]), dim=1)
+                )
+                x_h8 = self.fuse_h8(branch_features[1])
+                x_h16 = self.fuse_h16(branch_features[2])
+            x_h4 = x_h4.to(dtype=x.dtype)
+            x_h8 = x_h8.to(dtype=x.dtype)
+            x_h16 = x_h16.to(dtype=x.dtype)
+        else:
+            branch_features = self._check_branch_features(
+                self.semantic_branch(branch_input)
+            )
+            x_h4 = self.fuse_h4(
+                torch.cat((stem_h4, branch_features[0]), dim=1)
+            )
+            x_h8 = self.fuse_h8(branch_features[1])
+            x_h16 = self.fuse_h16(branch_features[2])
 
         return EncoderOutput(
             x_h=x_h,
@@ -367,6 +390,21 @@ class SLBRNextEncoder(nn.Module):
             x_h8=x_h8,
             x_h16=x_h16,
         )
+
+    @staticmethod
+    def _check_branch_features(
+        branch_features: Tensor | list[Tensor] | tuple[Tensor, ...],
+    ) -> list[Tensor]:
+        """Normalize the timm feature container to a 3-stage list."""
+        if isinstance(branch_features, dict):
+            branch_features = list(branch_features.values())
+        features = list(branch_features)
+        if len(features) != 3:
+            raise RuntimeError(
+                "The timm feature branch must return three stages at "
+                f"H/4, H/8 and H/16, got {len(features)}"
+            )
+        return features
 
     def extra_repr(self) -> str:
         return (
