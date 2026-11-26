@@ -24,16 +24,40 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from src.models.slbr_next.cache import (
-    CACHE_FORMAT,
-    CACHE_VERSION,
-    CacheError,
-    TeacherTargetCache,
-)
-from src.models.slbr_next.teacher import (
-    SLBRTeacher,
-    TeacherTarget,
-)
+# ``src.models.slbr_next`` is imported lazily in the autouse fixture below.
+# Importing it at collection time would put ``src.models`` into ``sys.modules``
+# before ``test_imports.py`` runs, breaking its import-isolation assertion even
+# though the networks package itself is still isolated.
+SLBRTeacher = None
+TeacherTarget = None
+TeacherTargetCache = None
+CacheError = None
+CACHE_FORMAT = None
+CACHE_VERSION = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _slbr_next_training_api():
+    """Load the training package only when this module's tests execute."""
+    global SLBRTeacher, TeacherTarget
+    global TeacherTargetCache, CacheError, CACHE_FORMAT, CACHE_VERSION
+    from src.models.slbr_next.cache import (
+        CACHE_FORMAT as cache_format,
+        CACHE_VERSION as cache_version,
+        CacheError as cache_error,
+        TeacherTargetCache as target_cache,
+    )
+    from src.models.slbr_next.teacher import (
+        SLBRTeacher as teacher_wrapper,
+        TeacherTarget as target_dataclass,
+    )
+
+    SLBRTeacher = teacher_wrapper
+    TeacherTarget = target_dataclass
+    TeacherTargetCache = target_cache
+    CacheError = cache_error
+    CACHE_FORMAT = cache_format
+    CACHE_VERSION = cache_version
 
 
 # ---------------------------------------------------------------------------
