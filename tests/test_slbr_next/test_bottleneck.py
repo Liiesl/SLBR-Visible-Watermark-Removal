@@ -495,6 +495,120 @@ def test_frequency_branch_runs_once_before_the_split(tiny_bottleneck):
 # ---------------------------------------------------------------------------
 
 
+def _autocast_cpu_enabled():
+    try:
+        return torch.is_autocast_enabled("cpu")
+    except TypeError:  # pragma: no cover - older torch signature
+        return torch.is_autocast_cpu_enabled()
+
+
+def test_h8_stem_fp32_under_bf16_autocast_keeps_grads_finite(monkeypatch):
+    """Regression guard for the 2xT4 Stage 2 FP16 backward overflow.
+
+    The smoke reports non-finite unscaled gradients first in
+    ``bottleneck.h8_stem.0.bias`` and the NAF block's
+    ``project_conv``/``mixer_expand`` 1x1 convolutions while the loss is
+    finite. The shared stem receives the summed mask-trunk, background-trunk
+    and frequency-branch gradient, so its FP16 weight/bias-gradient
+    accumulation over ``B * H/8 * W/8`` samples overflows under GradScaler's
+    initial 65536 scale.
+
+    CPU BF16 has FP32's exponent range and cannot reproduce an FP16 range
+    overflow by itself; as in the A2/A4 regressions, the conv spy is the
+    discriminator. Pre-fix the stem executes inside the autocast region
+    (``autocast_enabled=True``); post-fix every stem convolution must see
+    FP32 input/weight with autocast disabled. The large synthetic loss is
+    scaled by the same 65536 factor and still requires finite gradients for
+    the reported parameters.
+    """
+    torch.manual_seed(0)
+    bottleneck = SLBRNextBottleneck(
+        encoder_h8_channels=256,
+        encoder_h16_channels=64,
+        mask_width=32,
+        bg_width=32,
+        mask_width_h16=64,
+        bg_width_h16=64,
+        shared_width=256,
+        stem_blocks=1,
+        blocks_h8=1,
+        blocks_h16=1,
+        blocks_h8_post=1,
+        mdta_heads=2,
+        freq_width=32,
+        freq_heads=2,
+        freq_kernel_size=3,
+        dw_kernel_size=3,
+    ).train()
+
+    x_h8 = (torch.randn(2, 256, 32, 32) * 8.0).requires_grad_(True)
+    x_h16 = (torch.randn(2, 64, 16, 16) * 8.0).requires_grad_(True)
+
+    calls = []
+    stem_active = {"value": False}
+    real_conv2d = F.conv2d
+
+    def checked_conv2d(input, weight, *args, **kwargs):
+        if stem_active["value"]:
+            calls.append(
+                (
+                    input.dtype,
+                    weight.dtype,
+                    _autocast_cpu_enabled(),
+                )
+            )
+        return real_conv2d(input, weight, *args, **kwargs)
+
+    monkeypatch.setattr(F, "conv2d", checked_conv2d)
+    handles = [
+        bottleneck.h8_stem.register_forward_pre_hook(
+            lambda *_: stem_active.__setitem__("value", True)
+        ),
+        bottleneck.h8_stem.register_forward_hook(
+            lambda *_: stem_active.__setitem__("value", False)
+        ),
+    ]
+    try:
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            output = bottleneck.forward_features(x_h8, x_h16)
+            loss = 65536.0 * (
+                output.mask_h8.float().square().mean()
+                + output.mask_h16.float().square().mean()
+                + output.bg_h8.float().square().mean()
+                + output.bg_h16.float().square().mean()
+            )
+        assert torch.isfinite(loss)
+        loss.backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert calls
+    for input_dtype, weight_dtype, autocast_enabled in calls:
+        assert input_dtype == torch.float32
+        assert weight_dtype == torch.float32
+        assert autocast_enabled is False
+
+    parameters = dict(bottleneck.named_parameters())
+    for name in (
+        "h8_stem.0.bias",
+        "h8_stem.1.project_conv.weight",
+        "h8_stem.1.project_conv.bias",
+        "h8_stem.1.mixer_expand.weight",
+    ):
+        parameter = parameters[name]
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+
+    for name, parameter in bottleneck.h8_stem.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+
+    for tensor in (x_h8, x_h16):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+
+
 def test_interpolation_targets_reference_sizes(monkeypatch, tiny_bottleneck):
     recorded = []
     real_interpolate = F.interpolate
