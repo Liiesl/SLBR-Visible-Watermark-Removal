@@ -42,5 +42,5 @@ jobs:
           python -m pip list
 
       - name: Run SLBR-Next core block tests
-        run: python -m pytest -q -s tests/test_slbr_next --timeout=1800
+        run: python -m pytest -q -s -rs tests/test_slbr_next --timeout=1800
 
