@@ -337,6 +337,96 @@ def test_forward_fp16_cuda():
 
 
 # ---------------------------------------------------------------------------
+# FP16-autocast stability
+# ---------------------------------------------------------------------------
+
+
+def _autocast_cpu_enabled():
+    try:
+        return torch.is_autocast_enabled("cpu")
+    except TypeError:  # pragma: no cover - older torch signature
+        return torch.is_autocast_cpu_enabled()
+
+
+def test_attention_and_score_projections_are_explicitly_fp32(monkeypatch):
+    """All mask-decoder projections must run in FP32 with autocast disabled.
+
+    This is the regression guard for the 2xT4 smoke failure where
+    ``attention_h8.kv_proj.weight`` was the first non-finite gradient: on the
+    pre-fix code the conv/linear projections executed inside the autocast
+    region, so the spy records ``autocast_enabled=True`` (and reduced-precision
+    tensors). Both attention levels (H/8, H/4) and both score heads (H/2, H)
+    are exercised.
+    """
+    calls = []
+    real_conv2d = F.conv2d
+    real_linear = F.linear
+
+    def checked_conv2d(input, weight, *args, **kwargs):
+        calls.append(
+            ("conv2d", input.dtype, weight.dtype, _autocast_cpu_enabled())
+        )
+        return real_conv2d(input, weight, *args, **kwargs)
+
+    def checked_linear(input, weight, *args, **kwargs):
+        calls.append(
+            ("linear", input.dtype, weight.dtype, _autocast_cpu_enabled())
+        )
+        return real_linear(input, weight, *args, **kwargs)
+
+    monkeypatch.setattr(F, "conv2d", checked_conv2d)
+    monkeypatch.setattr(F, "linear", checked_linear)
+
+    decoder = _tiny_decoder()
+    queries = decoder.queries.detach()
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        with torch.no_grad():
+            decoder.attention_h8(torch.randn(1, 16, 16, 16), queries)
+            decoder.attention_h4(torch.randn(1, 12, 32, 32), queries)
+            decoder.score_h2(torch.randn(1, 8, 16, 16), queries)
+            decoder.score_h(torch.randn(1, 6, 32, 32), queries)
+
+    assert calls
+    assert {kind for kind, *_ in calls} == {"conv2d", "linear"}
+    for kind, input_dtype, weight_dtype, autocast_enabled in calls:
+        assert input_dtype == torch.float32, kind
+        assert weight_dtype == torch.float32, kind
+        assert autocast_enabled is False, kind
+
+
+def test_attention_bf16_autocast_stress_keeps_kv_grad_finite():
+    """Large-magnitude features must not poison the FP32 kv projection grad."""
+    torch.manual_seed(0)
+    attention = MaskedCrossAttention(
+        channels=16, query_dim=16, num_queries=9, heads=2
+    )
+    features = (torch.randn(2, 16, 32, 32) * 1e3).requires_grad_(True)
+    queries = (torch.randn(2, 9, 16) * 1e2).requires_grad_(True)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        updated_features, updated_queries, part_logits = attention(
+            features, queries
+        )
+        loss = (
+            updated_features.float().square().mean()
+            + updated_queries.float().square().mean()
+            + part_logits.float().square().mean()
+        )
+
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    assert attention.kv_proj.weight.grad is not None
+    assert torch.isfinite(attention.kv_proj.weight.grad).all()
+    assert attention.kv_proj.bias.grad is not None
+    assert torch.isfinite(attention.kv_proj.bias.grad).all()
+    for name, parameter in attention.named_parameters():
+        assert parameter.grad is not None, f"missing gradient for {name}"
+        assert torch.isfinite(parameter.grad).all(), name
+
+
+# ---------------------------------------------------------------------------
 # Attention mechanics
 # ---------------------------------------------------------------------------
 
