@@ -5,13 +5,6 @@ import math
 import pytest
 import torch
 
-from src.models.slbr_next.losses_stage2 import (
-    BLEND_MODES,
-    Stage2Loss,
-    SyntheticComposite,
-    build_synthetic_composite,
-)
-
 BATCH = 2
 HEIGHT = 24
 WIDTH = 40
@@ -31,6 +24,20 @@ LOSS_KEYS = {
     "alpha_l1",
     "alpha_grad",
 }
+
+
+@pytest.fixture(scope="module")
+def losses():
+    """Import lazily so test collection does not pull ``src.models``.
+
+    ``test_imports.py`` asserts that importing ``src.networks.slbr_next``
+    leaves ``src.models`` out of ``sys.modules``. Pytest imports every test
+    module during collection, so this module's import of the training package
+    must happen at test time, after the isolation check.
+    """
+    from src.models.slbr_next import losses_stage2
+
+    return losses_stage2
 
 
 class DummyPerceptual(torch.nn.Module):
@@ -72,7 +79,7 @@ def _inputs(
     return clean, refine, coarse, mask, logits, alpha_pred, alpha_gt
 
 
-def _call(criterion: Stage2Loss, tensors, **kwargs) -> dict[str, torch.Tensor]:
+def _call(criterion, tensors, **kwargs) -> dict[str, torch.Tensor]:
     clean, refine, coarse, mask, logits, _, _ = tensors
     return criterion(
         refine,
@@ -100,15 +107,15 @@ def _blend_inputs(batch: int = 3, height: int = 16, width: int = 24):
     return background, watermark
 
 
-def test_linear_composite_returns_true_alpha():
+def test_linear_composite_returns_true_alpha(losses):
     background, watermark = _blend_inputs()
     alpha = torch.tensor([0.1, 0.5, 0.9]).view(3, 1, 1, 1)
 
-    composite = build_synthetic_composite(
+    composite = losses.build_synthetic_composite(
         background, watermark, modes="linear", alpha=alpha
     )
 
-    assert isinstance(composite, SyntheticComposite)
+    assert isinstance(composite, losses.SyntheticComposite)
     assert composite.modes == ("linear",) * 3
     assert composite.alpha is not None
     assert composite.alpha.shape == (3, 1, 16, 24)
@@ -122,10 +129,10 @@ def test_linear_composite_returns_true_alpha():
 
 
 @pytest.mark.parametrize("mode", ["screen", "multiply"])
-def test_nonlinear_composites_return_no_alpha(mode):
+def test_nonlinear_composites_return_no_alpha(mode, losses):
     background, watermark = _blend_inputs()
 
-    composite = build_synthetic_composite(
+    composite = losses.build_synthetic_composite(
         background,
         watermark,
         modes=mode,
@@ -141,7 +148,7 @@ def test_nonlinear_composites_return_no_alpha(mode):
     torch.testing.assert_close(composite.image, expected)
 
     # Alpha is ignored for nonlinear families.
-    other = build_synthetic_composite(
+    other = losses.build_synthetic_composite(
         background,
         watermark,
         modes=mode,
@@ -150,12 +157,12 @@ def test_nonlinear_composites_return_no_alpha(mode):
     torch.testing.assert_close(other.image, composite.image)
 
 
-def test_per_sample_modes_and_alpha():
+def test_per_sample_modes_and_alpha(losses):
     background, watermark = _blend_inputs(batch=4)
     modes = ("linear", "screen", "multiply", "linear")
     alpha = torch.tensor([0.2, 0.4, 0.6, 0.8]).view(4, 1, 1, 1)
 
-    composite = build_synthetic_composite(
+    composite = losses.build_synthetic_composite(
         background, watermark, modes=modes, alpha=alpha
     )
 
@@ -166,23 +173,26 @@ def test_per_sample_modes_and_alpha():
     assert torch.count_nonzero(composite.alpha[2]).item() == 0
 
     torch.testing.assert_close(
-        composite.image[0], (1.0 - alpha[0]) * background[0] + alpha[0] * watermark[0]
+        composite.image[0],
+        (1.0 - alpha[0]) * background[0] + alpha[0] * watermark[0],
     )
     torch.testing.assert_close(
-        composite.image[1], 1.0 - (1.0 - background[1]) * (1.0 - watermark[1])
+        composite.image[1],
+        1.0 - (1.0 - background[1]) * (1.0 - watermark[1]),
     )
     torch.testing.assert_close(
         composite.image[2], background[2] * watermark[2]
     )
     torch.testing.assert_close(
-        composite.image[3], (1.0 - alpha[3]) * background[3] + alpha[3] * watermark[3]
+        composite.image[3],
+        (1.0 - alpha[3]) * background[3] + alpha[3] * watermark[3],
     )
     torch.testing.assert_close(
         composite.alpha[0], alpha[0].expand(1, 16, 24)
     )
 
 
-def test_random_alpha_is_reproducible_and_bounded():
+def test_random_alpha_is_reproducible_and_bounded(losses):
     background, watermark = _blend_inputs()
     kwargs = dict(
         modes="linear",
@@ -192,10 +202,10 @@ def test_random_alpha_is_reproducible_and_bounded():
     generator_a = torch.Generator().manual_seed(123)
     generator_b = torch.Generator().manual_seed(123)
 
-    first = build_synthetic_composite(
+    first = losses.build_synthetic_composite(
         background, watermark, generator=generator_a, **kwargs
     )
-    second = build_synthetic_composite(
+    second = losses.build_synthetic_composite(
         background, watermark, generator=generator_b, **kwargs
     )
 
@@ -205,20 +215,22 @@ def test_random_alpha_is_reproducible_and_bounded():
     assert float(first.alpha.max()) <= 0.6 + 1e-6
 
 
-def test_composite_rejects_bad_modes_and_shapes():
+def test_composite_rejects_bad_modes_and_shapes(losses):
     background, watermark = _blend_inputs()
 
-    assert BLEND_MODES == ("linear", "screen", "multiply")
+    assert losses.BLEND_MODES == ("linear", "screen", "multiply")
     with pytest.raises(ValueError):
-        build_synthetic_composite(
+        losses.build_synthetic_composite(
             background, watermark, modes="overlay"
         )
     with pytest.raises(ValueError):
-        build_synthetic_composite(
+        losses.build_synthetic_composite(
             background, watermark, modes=("linear",)
         )
     with pytest.raises(ValueError):
-        build_synthetic_composite(background, watermark[:, :, :, :5])
+        losses.build_synthetic_composite(
+            background, watermark[:, :, :, :5]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -226,40 +238,44 @@ def test_composite_rejects_bad_modes_and_shapes():
 # ---------------------------------------------------------------------------
 
 
-def test_all_components_are_finite_with_finite_gradients():
+def test_all_components_are_finite_with_finite_gradients(losses):
     tensors = _inputs()
-    clean, refine, coarse, mask, logits, alpha_pred, alpha_gt = tensors
-    criterion = Stage2Loss(perceptual=DummyPerceptual())
+    refine = tensors[1]
+    coarse = tensors[2]
+    logits = tensors[4]
+    alpha_pred = tensors[5]
+    criterion = losses.Stage2Loss(perceptual=DummyPerceptual())
     criterion.set_progress(1, 2)
 
-    losses = _call(
+    result = _call(
         criterion,
         tensors,
         alpha_pred=alpha_pred,
-        alpha_gt=alpha_gt,
+        alpha_gt=tensors[6],
         alpha_valid=torch.tensor([True, True]),
     )
 
-    assert set(losses) == LOSS_KEYS
-    for key, value in losses.items():
+    assert set(result) == LOSS_KEYS
+    for key, value in result.items():
         assert value.shape == (), key
         assert value.dtype == torch.float32, key
         assert torch.isfinite(value).all(), key
 
-    losses["total"].backward()
+    result["total"].backward()
 
     for tensor in (refine, coarse, logits, alpha_pred):
         assert tensor.grad is not None
         assert torch.isfinite(tensor.grad).all()
 
 
-def test_fixed_batch_matches_documented_weights():
+def test_fixed_batch_matches_documented_weights(losses):
     tensors = _inputs(seed=5)
-    clean, refine, coarse, mask, logits, alpha_pred, alpha_gt = tensors
-    criterion = Stage2Loss(perceptual=DummyPerceptual())
+    alpha_pred = tensors[5]
+    alpha_gt = tensors[6]
+    criterion = losses.Stage2Loss(perceptual=DummyPerceptual())
     criterion.set_progress(1, 1)
 
-    losses = _call(
+    result = _call(
         criterion,
         tensors,
         alpha_pred=alpha_pred,
@@ -268,29 +284,29 @@ def test_fixed_batch_matches_documented_weights():
     )
 
     expected_total = (
-        1.0 * losses["reconstruction"]
-        + 0.1 * losses["perceptual"]
-        + 0.05 * losses["fft"]
-        + 1.0 * losses["mask"]
-        + 0.5 * losses["alpha"]
+        1.0 * result["reconstruction"]
+        + 0.1 * result["perceptual"]
+        + 0.05 * result["fft"]
+        + 1.0 * result["mask"]
+        + 0.5 * result["alpha"]
     )
-    torch.testing.assert_close(losses["total"], expected_total)
+    torch.testing.assert_close(result["total"], expected_total)
     torch.testing.assert_close(
-        losses["reconstruction"],
+        result["reconstruction"],
         0.5
-        * (losses["charbonnier_refine"] + losses["charbonnier_coarse"]),
+        * (result["charbonnier_refine"] + result["charbonnier_coarse"]),
     )
     torch.testing.assert_close(
-        losses["mask"],
-        losses["mask_focal"]
-        + losses["mask_dice"]
-        + losses["mask_sobel"],
+        result["mask"],
+        result["mask_focal"]
+        + result["mask_dice"]
+        + result["mask_sobel"],
     )
-    assert losses["perceptual"].item() > 0
-    assert losses["fft"].item() > 0
+    assert result["perceptual"].item() > 0
+    assert result["fft"].item() > 0
 
 
-def test_perfect_prediction_hits_charbonnier_floor():
+def test_perfect_prediction_hits_charbonnier_floor(losses):
     clean, _, _, mask, logits, alpha_pred, alpha_gt = _inputs(seed=7)
     tensors = (
         clean,
@@ -301,15 +317,15 @@ def test_perfect_prediction_hits_charbonnier_floor():
         alpha_pred,
         alpha_gt,
     )
-    criterion = Stage2Loss(perceptual=None)
+    criterion = losses.Stage2Loss(perceptual=None)
 
-    losses = _call(criterion, tensors)
+    result = _call(criterion, tensors)
 
     # sqrt(0 + eps^2) = eps inside and outside. The 5 px dilation usually
     # covers the whole small test mask, so the anchor adds 0 to 0.1 eps.
     floor = criterion.charbonnier_eps
     for key in ("charbonnier_refine", "reconstruction"):
-        value = losses[key].item()
+        value = result[key].item()
         assert floor - 1e-7 <= value <= 1.1 * floor + 1e-7, key
 
 
@@ -318,10 +334,11 @@ def test_perfect_prediction_hits_charbonnier_floor():
 # ---------------------------------------------------------------------------
 
 
-def test_alpha_loss_only_for_valid_linear_samples():
+def test_alpha_loss_only_for_valid_linear_samples(losses):
     tensors = _inputs(seed=3)
-    clean, refine, coarse, mask, logits, alpha_pred, alpha_gt = tensors
-    criterion = Stage2Loss(perceptual=None)
+    alpha_pred = tensors[5]
+    alpha_gt = tensors[6]
+    criterion = losses.Stage2Loss(perceptual=None)
 
     linear = _call(
         criterion,
@@ -360,31 +377,35 @@ def test_alpha_loss_only_for_valid_linear_samples():
     )
 
 
-def test_no_linear_samples_keep_a_zero_alpha_gradient():
+def test_no_linear_samples_keep_a_zero_alpha_gradient(losses):
     tensors = _inputs(seed=4)
-    _, _, _, _, _, alpha_pred, alpha_gt = tensors
-    criterion = Stage2Loss(perceptual=None)
+    alpha_pred = tensors[5]
+    criterion = losses.Stage2Loss(perceptual=None)
 
-    losses = _call(
+    result = _call(
         criterion,
         tensors,
         alpha_pred=alpha_pred,
-        alpha_gt=alpha_gt,
+        alpha_gt=tensors[6],
         alpha_valid=torch.zeros(BATCH, dtype=torch.bool),
     )
-    losses["total"].backward()
+    result["total"].backward()
 
     assert alpha_pred.grad is not None
     assert torch.count_nonzero(alpha_pred.grad).item() == 0
 
 
-def test_alpha_gt_requires_validity_mask():
+def test_alpha_gt_requires_validity_mask(losses):
     tensors = _inputs(seed=6)
-    _, _, _, _, _, alpha_pred, alpha_gt = tensors
-    criterion = Stage2Loss(perceptual=None)
+    criterion = losses.Stage2Loss(perceptual=None)
 
     with pytest.raises(ValueError):
-        _call(criterion, tensors, alpha_pred=alpha_pred, alpha_gt=alpha_gt)
+        _call(
+            criterion,
+            tensors,
+            alpha_pred=tensors[5],
+            alpha_gt=tensors[6],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -392,11 +413,12 @@ def test_alpha_gt_requires_validity_mask():
 # ---------------------------------------------------------------------------
 
 
-def test_perceptual_activates_late_and_uses_refine_bg_only():
+def test_perceptual_activates_late_and_uses_refine_bg_only(losses):
     tensors = _inputs(seed=8)
-    clean, refine, _, _, _, _, _ = tensors
+    clean = tensors[0]
+    refine = tensors[1]
     dummy = DummyPerceptual()
-    criterion = Stage2Loss(perceptual=dummy)
+    criterion = losses.Stage2Loss(perceptual=dummy)
 
     criterion.set_progress(0, 100)
     assert not criterion.perceptual_active
@@ -421,23 +443,23 @@ def test_perceptual_activates_late_and_uses_refine_bg_only():
     torch.testing.assert_close(target, clean)
 
 
-def test_perceptual_can_be_disabled_and_progress_is_clamped():
+def test_perceptual_can_be_disabled_and_progress_is_clamped(losses):
     tensors = _inputs(seed=9)
-    criterion = Stage2Loss(perceptual=None)
+    criterion = losses.Stage2Loss(perceptual=None)
     criterion.set_progress(500, 100)
 
     assert criterion.progress == pytest.approx(1.0)
     assert not criterion.perceptual_active
-    losses = _call(criterion, tensors)
-    assert losses["perceptual"].item() == 0.0
-    assert torch.isfinite(losses["total"]).all()
+    result = _call(criterion, tensors)
+    assert result["perceptual"].item() == 0.0
+    assert torch.isfinite(result["total"]).all()
 
     with pytest.raises(ValueError):
         criterion.set_progress(1, 0)
 
 
-def test_auto_perceptual_backend_is_lazy():
-    criterion = Stage2Loss(perceptual="auto")
+def test_auto_perceptual_backend_is_lazy(losses):
+    criterion = losses.Stage2Loss(perceptual="auto")
 
     assert criterion.perceptual is None
     assert not criterion.perceptual_active
@@ -448,7 +470,7 @@ def test_auto_perceptual_backend_is_lazy():
 # ---------------------------------------------------------------------------
 
 
-def test_fft_path_is_fp32_under_autocast(monkeypatch):
+def test_fft_path_is_fp32_under_autocast(monkeypatch, losses):
     tensors = _inputs(seed=10)
     seen_dtypes: list[torch.dtype] = []
     original_rfft2 = torch.fft.rfft2
@@ -458,16 +480,18 @@ def test_fft_path_is_fp32_under_autocast(monkeypatch):
         return original_rfft2(input, *args, **kwargs)
 
     monkeypatch.setattr(torch.fft, "rfft2", spy)
-    criterion = Stage2Loss(perceptual=None, fft_scales=(1.0, 0.5))
+    criterion = losses.Stage2Loss(
+        perceptual=None, fft_scales=(1.0, 0.5)
+    )
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        losses = _call(criterion, tensors)
+        result = _call(criterion, tensors)
 
     assert seen_dtypes
     assert all(dtype == torch.float32 for dtype in seen_dtypes)
     assert len(seen_dtypes) == 2 * 2  # two scales, magnitude/real-imag FFT
-    assert torch.isfinite(losses["fft"]).all()
-    assert losses["fft"].item() > 0.0
+    assert torch.isfinite(result["fft"]).all()
+    assert result["fft"].item() > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +499,7 @@ def test_fft_path_is_fp32_under_autocast(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_non_square_mask_levels_and_sobel():
+def test_non_square_mask_levels_and_sobel(losses):
     height, width = 37, 83
     generator = torch.Generator().manual_seed(13)
     clean = torch.rand(BATCH, 3, height, width, generator=generator)
@@ -507,14 +531,14 @@ def test_non_square_mask_levels_and_sobel():
             generator=generator,
         ).requires_grad_(True),
     ]
-    criterion = Stage2Loss(perceptual=None)
+    criterion = losses.Stage2Loss(perceptual=None)
 
-    losses = criterion(refine, coarse, levels, clean, mask)
+    result = criterion(refine, coarse, levels, clean, mask)
 
     for key in ("mask", "mask_focal", "mask_dice", "mask_sobel", "fft"):
-        assert torch.isfinite(losses[key]).all(), key
+        assert torch.isfinite(result[key]).all(), key
 
-    losses["total"].backward()
+    result["total"].backward()
     for level in levels:
         assert level.grad is not None
         assert torch.isfinite(level.grad).all()
